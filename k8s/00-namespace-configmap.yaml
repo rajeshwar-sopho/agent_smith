@@ -1,0 +1,21 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: bot-orchestrator
+  labels:
+    app.kubernetes.io/name: bot-orchestrator
+
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: bot-orchestrator-config
+  namespace: bot-orchestrator
+data:
+  NODE_ENV: "production"
+  PORT: "4000"
+  DATABASE_URL: "file:/app/data/bot-orchestrator.db"
+  WORKSPACE_ROOT: "/workspaces"
+  CORS_ORIGIN: "http://frontend-service"
+  BOT_IMAGE: "bot-orchestrator-runtime:latest"
+  BACKEND_URL: "http://backend-service:4000"

@@ -1,0 +1,12 @@
+{
+  "name": "bot-runtime",
+  "version": "1.0.0",
+  "type": "commonjs",
+  "scripts": {
+    "start": "node src/agent.js"
+  },
+  "dependencies": {
+    "ws": "^8.17.0",
+    "node-fetch": "^2.7.0"
+  }
+}

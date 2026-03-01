@@ -1,0 +1,16 @@
+{
+  "name": "bot-orchestrator",
+  "version": "1.0.0",
+  "private": true,
+  "workspaces": ["backend", "frontend", "bot-runtime"],
+  "scripts": {
+    "dev": "concurrently \"npm run dev --workspace=backend\" \"npm run dev --workspace=frontend\"",
+    "build": "npm run build --workspace=backend && npm run build --workspace=frontend",
+    "docker:up": "docker-compose up --build",
+    "docker:down": "docker-compose down",
+    "lint": "eslint . --ext .ts,.tsx,.js"
+  },
+  "devDependencies": {
+    "concurrently": "^8.2.2"
+  }
+}

@@ -1,0 +1,90 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: backend
+  namespace: bot-orchestrator
+  labels:
+    app: backend
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: backend
+  template:
+    metadata:
+      labels:
+        app: backend
+    spec:
+      serviceAccountName: bot-orchestrator-sa
+      containers:
+        - name: backend
+          image: your-registry/bot-orchestrator-backend:latest  # Replace with your image
+          imagePullPolicy: Always
+          ports:
+            - containerPort: 4000
+              name: http
+          envFrom:
+            - configMapRef:
+                name: bot-orchestrator-config
+            - secretRef:
+                name: bot-orchestrator-secrets
+          volumeMounts:
+            - name: backend-data
+              mountPath: /app/data
+            - name: workspaces
+              mountPath: /workspaces
+            - name: docker-sock
+              mountPath: /var/run/docker.sock
+          resources:
+            requests:
+              memory: "256Mi"
+              cpu: "250m"
+            limits:
+              memory: "1Gi"
+              cpu: "1000m"
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 4000
+            initialDelaySeconds: 30
+            periodSeconds: 10
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 4000
+            initialDelaySeconds: 10
+            periodSeconds: 5
+      volumes:
+        - name: backend-data
+          persistentVolumeClaim:
+            claimName: backend-data-pvc
+        - name: workspaces
+          persistentVolumeClaim:
+            claimName: workspaces-pvc
+        - name: docker-sock
+          hostPath:
+            path: /var/run/docker.sock
+            type: Socket
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: backend-service
+  namespace: bot-orchestrator
+spec:
+  selector:
+    app: backend
+  ports:
+    - name: http
+      port: 4000
+      targetPort: 4000
+  type: ClusterIP
+
+---
+# ServiceAccount for backend (needed for Docker socket access)
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: bot-orchestrator-sa
+  namespace: bot-orchestrator

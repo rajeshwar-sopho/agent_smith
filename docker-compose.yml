@@ -1,0 +1,64 @@
+services:
+  # ─── Backend ───────────────────────────────────────────────────────────────
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: bot-orchestrator-backend
+    restart: unless-stopped
+    ports:
+      - "4000:4000"
+    environment:
+      NODE_ENV: production
+      PORT: 4000
+      DATABASE_URL: file:/app/data/bot-orchestrator.db
+      WORKSPACE_ROOT: /workspaces
+      CORS_ORIGIN: http://localhost:3001
+      BOT_IMAGE: bot-orchestrator-runtime:latest
+      BACKEND_URL: http://backend:4000
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      GEMINI_API_KEY: ${GEMINI_API_KEY:-}
+    volumes:
+      - backend-data:/app/data           # SQLite database
+      - workspaces:/workspaces            # Bot workspace files
+      - /var/run/docker.sock:/var/run/docker.sock  # Docker-in-Docker for spawning bots
+    depends_on: []
+    networks:
+      - bot-orchestrator
+
+  # ─── Frontend ──────────────────────────────────────────────────────────────
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    container_name: bot-orchestrator-frontend
+    restart: unless-stopped
+    ports:
+      - "3001:80"
+    depends_on:
+      - backend
+    networks:
+      - bot-orchestrator
+
+  # ─── Bot Runtime Image (pre-built, used by backend to spawn containers) ────
+  # This service just builds the image — containers are spawned dynamically
+  bot-runtime-builder:
+    build:
+      context: ./bot-runtime
+      dockerfile: Dockerfile
+    image: bot-orchestrator-runtime:latest
+    # This service won't actually run — we just want the image built
+    command: ["echo", "Bot runtime image built successfully"]
+    profiles:
+      - build
+
+volumes:
+  backend-data:
+    driver: local
+  workspaces:
+    driver: local
+
+networks:
+  bot-orchestrator:
+    driver: bridge
+    name: bot-orchestrator_default
