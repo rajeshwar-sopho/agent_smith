@@ -9,7 +9,9 @@ let globalWs: WebSocket | null = null;
 const handlers = new Set<Handler>();
 
 function getWs(): WebSocket {
-  if (globalWs && globalWs.readyState === WebSocket.OPEN) return globalWs;
+  if (globalWs && (globalWs.readyState === WebSocket.OPEN || globalWs.readyState === WebSocket.CONNECTING)) {
+    return globalWs;
+  }
 
   const ws = new WebSocket(WS_URL);
   globalWs = ws;
@@ -23,7 +25,6 @@ function getWs(): WebSocket {
 
   ws.onclose = () => {
     globalWs = null;
-    // Reconnect after 2s
     setTimeout(() => getWs(), 2000);
   };
 
@@ -37,7 +38,7 @@ export function useWebSocket(handler: Handler) {
   useEffect(() => {
     const h: Handler = (msg) => handlerRef.current(msg);
     handlers.add(h);
-    getWs(); // ensure connected
+    getWs();
     return () => { handlers.delete(h); };
   }, []);
 }
@@ -46,15 +47,26 @@ export function useSubscribeToBot(botId: string | null, handler: Handler) {
   useEffect(() => {
     if (!botId) return;
     const ws = getWs();
+
     const subscribe = () => {
       if (ws.readyState === WebSocket.OPEN) {
         ws.send(JSON.stringify({ type: 'subscribe', botId }));
       }
     };
-    if (ws.readyState === WebSocket.OPEN) subscribe();
-    else ws.addEventListener('open', subscribe);
+
+    if (ws.readyState === WebSocket.OPEN) {
+      subscribe();
+    } else {
+      ws.addEventListener('open', subscribe);
+    }
+
     return () => {
-      ws.send(JSON.stringify({ type: 'unsubscribe', botId }));
+      // Always remove the open listener to avoid subscribe firing after unmount
+      ws.removeEventListener('open', subscribe);
+      // Only send unsubscribe if the socket is actually open
+      if (ws.readyState === WebSocket.OPEN) {
+        ws.send(JSON.stringify({ type: 'unsubscribe', botId }));
+      }
     };
   }, [botId]);
 

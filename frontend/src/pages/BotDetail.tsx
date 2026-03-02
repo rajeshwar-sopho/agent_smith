@@ -1,6 +1,6 @@
 import React, { useEffect, useState, useRef, useCallback } from 'react';
 import { useParams, useNavigate } from 'react-router-dom';
-import { ArrowLeft, Send, RefreshCw, Trash2, FolderOpen, FileText, ChevronRight, ChevronDown, Image } from 'lucide-react';
+import { ArrowLeft, Send, RefreshCw, Trash2, FolderOpen, FileText, ChevronRight, ChevronDown } from 'lucide-react';
 import { api, Bot, Task, Log, HumanQuestion, FileNode } from '../lib/api';
 import StatusBadge from '../components/StatusBadge';
 import { useSubscribeToBot } from '../hooks/useWebSocket';
@@ -19,6 +19,7 @@ export default function BotDetail() {
   const [taskDesc, setTaskDesc] = useState('');
   const [submitting, setSubmitting] = useState(false);
   const [activeTab, setActiveTab] = useState<'logs' | 'tasks' | 'files' | 'screenshots'>('logs');
+  const [selectedTaskId, setSelectedTaskId] = useState<string | null>(null);
   const logEndRef = useRef<HTMLDivElement>(null);
   const [selectedFile, setSelectedFile] = useState<{ path: string; content: string } | null>(null);
 
@@ -45,7 +46,8 @@ export default function BotDetail() {
   useSubscribeToBot(id || null, useCallback((msg) => {
     if (msg.type === 'log') {
       setLogs(prev => [...prev, {
-        id: Date.now().toString(), botId: id!, taskId: null,
+        id: Date.now().toString(), botId: id!,
+        taskId: (msg.payload as { taskId?: string }).taskId ?? null,
         level: (msg.payload as { level: string }).level as Log['level'],
         message: (msg.payload as { message: string }).message,
         meta: null,
@@ -63,15 +65,23 @@ export default function BotDetail() {
     }
   }, [id, loadAll]));
 
-  useEffect(() => { logEndRef.current?.scrollIntoView({ behavior: 'smooth' }); }, [logs]);
+  // Auto-scroll only when viewing the selected task's logs
+  useEffect(() => {
+    if (activeTab === 'logs') {
+      logEndRef.current?.scrollIntoView({ behavior: 'smooth' });
+    }
+  }, [logs, activeTab]);
 
   const handleSubmitTask = async () => {
     if (!taskInput.trim() || !id) return;
     setSubmitting(true);
     try {
-      await api.createTask({ botId: id, title: taskInput.trim(), description: taskDesc.trim() || taskInput.trim() });
+      const newTask = await api.createTask({ botId: id, title: taskInput.trim(), description: taskDesc.trim() || taskInput.trim() });
       setTaskInput('');
       setTaskDesc('');
+      // Auto-select the new task and switch to logs tab
+      setSelectedTaskId(newTask.id);
+      setActiveTab('logs');
       loadAll();
     } finally {
       setSubmitting(false);
@@ -84,6 +94,18 @@ export default function BotDetail() {
     setSelectedFile(file);
   };
 
+  const handleTaskSelect = (taskId: string) => {
+    setSelectedTaskId(prev => prev === taskId ? null : taskId);
+    setActiveTab('logs');
+  };
+
+  // Filter logs by selected task
+  const visibleLogs = selectedTaskId
+    ? logs.filter(l => l.taskId === selectedTaskId)
+    : [];
+
+  const selectedTask = tasks.find(t => t.id === selectedTaskId) ?? null;
+
   if (!bot) return <div style={{ padding: 48, color: '#475569', textAlign: 'center' }}>Loading bot...</div>;
 
   return (
@@ -95,25 +117,26 @@ export default function BotDetail() {
         background: '#0c0c15', flexShrink: 0,
       }}>
         <button onClick={() => navigate('/bots')} style={{
-          background: 'none', border: 'none', color: '#475569', display: 'flex', alignItems: 'center', gap: 4,
+          background: 'none', border: 'none', color: '#475569', cursor: 'pointer',
+          display: 'flex', alignItems: 'center', gap: 4,
         }}>
           <ArrowLeft size={16} />
         </button>
         <div style={{ display: 'flex', alignItems: 'center', gap: 10, flex: 1 }}>
-          <div style={{ fontSize: 20 }}>{bot.model === 'claude' ? '🧠' : '✨'}</div>
+          <div style={{ fontSize: 20 }}>{bot.model.startsWith('gemini') ? '✨' : '🧠'}</div>
           <div>
             <div style={{ fontWeight: 700, fontSize: 16, color: '#f1f5f9' }}>{bot.name}</div>
-            <div style={{ fontSize: 11, color: '#475569', fontFamily: 'DM Mono' }}>{bot.id}</div>
+            <div style={{ fontSize: 11, color: '#475569', fontFamily: 'DM Mono' }}>{bot.model}</div>
           </div>
         </div>
         <StatusBadge status={bot.status} />
         <button onClick={() => api.restartBot(bot.id).then(loadAll)} style={{
-          background: '#1e293b', border: 'none', color: '#64748b', padding: '6px 10px', borderRadius: 8,
+          background: '#1e293b', border: 'none', color: '#64748b', padding: '6px 10px', borderRadius: 8, cursor: 'pointer',
         }}>
           <RefreshCw size={14} />
         </button>
         <button onClick={async () => { if (confirm('Delete this bot?')) { await api.deleteBot(bot.id); navigate('/bots'); } }} style={{
-          background: '#f43f5e15', border: 'none', color: '#f43f5e', padding: '6px 10px', borderRadius: 8,
+          background: '#f43f5e15', border: 'none', color: '#f43f5e', padding: '6px 10px', borderRadius: 8, cursor: 'pointer',
         }}>
           <Trash2 size={14} />
         </button>
@@ -126,7 +149,8 @@ export default function BotDetail() {
 
       {/* 3-panel layout */}
       <div style={{ display: 'flex', flex: 1, overflow: 'hidden' }}>
-        {/* Left: Task input */}
+
+        {/* Left: Task input + task list */}
         <div style={{
           width: 280, borderRight: '1px solid #1e293b', display: 'flex',
           flexDirection: 'column', background: '#0c0c15', flexShrink: 0,
@@ -167,38 +191,59 @@ export default function BotDetail() {
             </button>
           </div>
 
-          {/* Task list */}
+          {/* Task list — click to select and view logs */}
           <div style={{ flex: 1, overflow: 'auto', padding: 12 }}>
             <div style={{ fontSize: 11, color: '#475569', fontFamily: 'DM Mono', textTransform: 'uppercase', letterSpacing: 1, marginBottom: 8 }}>
               Tasks ({tasks.length})
             </div>
-            {tasks.map(task => (
-              <div key={task.id} style={{
-                background: '#13131c', border: '1px solid #1e293b', borderRadius: 8,
-                padding: '10px 12px', marginBottom: 8,
-              }}>
-                <div style={{ fontSize: 12, fontWeight: 600, color: '#e2e8f0', marginBottom: 4 }}>{task.title}</div>
-                <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
-                  <StatusBadge status={task.status} size="sm" />
-                  <span style={{ fontSize: 10, color: '#475569' }}>
-                    {formatDistanceToNow(new Date(task.createdAt), { addSuffix: true })}
-                  </span>
-                </div>
-                {task.tokenUsage > 0 && (
-                  <div style={{ fontSize: 10, color: '#475569', marginTop: 4 }}>
-                    {task.tokenUsage.toLocaleString()} tokens
+            {tasks.length === 0 ? (
+              <div style={{ fontSize: 12, color: '#334155', textAlign: 'center', marginTop: 24 }}>No tasks yet</div>
+            ) : tasks.map(task => {
+              const isSelected = selectedTaskId === task.id;
+              return (
+                <div
+                  key={task.id}
+                  onClick={() => handleTaskSelect(task.id)}
+                  style={{
+                    background: isSelected ? '#8b5cf615' : '#13131c',
+                    border: `1px solid ${isSelected ? '#8b5cf6' : '#1e293b'}`,
+                    borderRadius: 8, padding: '10px 12px', marginBottom: 8,
+                    cursor: 'pointer', transition: 'all 0.15s',
+                  }}
+                  onMouseEnter={e => !isSelected && ((e.currentTarget as HTMLElement).style.borderColor = '#334155')}
+                  onMouseLeave={e => !isSelected && ((e.currentTarget as HTMLElement).style.borderColor = '#1e293b')}
+                >
+                  <div style={{ fontSize: 12, fontWeight: 600, color: isSelected ? '#c4b5fd' : '#e2e8f0', marginBottom: 4 }}>
+                    {task.title}
                   </div>
-                )}
-              </div>
-            ))}
+                  <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
+                    <StatusBadge status={task.status} size="sm" />
+                    <span style={{ fontSize: 10, color: '#475569' }}>
+                      {formatDistanceToNow(new Date(task.createdAt), { addSuffix: true })}
+                    </span>
+                  </div>
+                  {task.tokenUsage > 0 && (
+                    <div style={{ fontSize: 10, color: '#475569', marginTop: 4 }}>
+                      {task.tokenUsage.toLocaleString()} tokens
+                    </div>
+                  )}
+                  {isSelected && (
+                    <div style={{ fontSize: 10, color: '#8b5cf6', marginTop: 4 }}>
+                      → viewing logs
+                    </div>
+                  )}
+                </div>
+              );
+            })}
           </div>
         </div>
 
-        {/* Center: Activity feed / logs */}
+        {/* Center: Activity feed */}
         <div style={{ flex: 1, display: 'flex', flexDirection: 'column', minWidth: 0 }}>
+          {/* Tabs */}
           <div style={{
             display: 'flex', gap: 0, borderBottom: '1px solid #1e293b',
-            background: '#0c0c15', flexShrink: 0,
+            background: '#0c0c15', flexShrink: 0, alignItems: 'center',
           }}>
             {(['logs', 'tasks', 'files', 'screenshots'] as const).map(tab => (
               <button key={tab} onClick={() => setActiveTab(tab)} style={{
@@ -210,34 +255,73 @@ export default function BotDetail() {
                 {tab}
               </button>
             ))}
+            {/* Selected task pill in header */}
+            {activeTab === 'logs' && selectedTask && (
+              <div style={{
+                marginLeft: 'auto', marginRight: 16, display: 'flex', alignItems: 'center', gap: 8,
+              }}>
+                <span style={{
+                  fontSize: 11, color: '#8b5cf6', background: '#8b5cf615',
+                  border: '1px solid #8b5cf630', borderRadius: 20, padding: '3px 10px',
+                  fontFamily: 'DM Mono', maxWidth: 180, overflow: 'hidden',
+                  textOverflow: 'ellipsis', whiteSpace: 'nowrap',
+                }}>
+                  {selectedTask.title}
+                </span>
+                <button
+                  onClick={() => setSelectedTaskId(null)}
+                  title="Clear selection"
+                  style={{
+                    background: 'none', border: 'none', color: '#475569',
+                    cursor: 'pointer', fontSize: 14, lineHeight: 1, padding: 0,
+                  }}
+                >
+                  ✕
+                </button>
+              </div>
+            )}
           </div>
 
+          {/* Logs tab */}
           {activeTab === 'logs' && (
             <div style={{ flex: 1, overflow: 'auto', padding: 16, fontFamily: 'DM Mono', fontSize: 12 }}>
-              {logs.length === 0 ? (
-                <div style={{ color: '#334155', textAlign: 'center', marginTop: 48 }}>No logs yet. Submit a task to get started.</div>
-              ) : logs.map((log, i) => (
-                <div key={log.id || i} style={{
-                  display: 'flex', gap: 12, marginBottom: 6, lineHeight: 1.5,
-                  color: log.level === 'error' ? '#f43f5e' : log.level === 'tool' ? '#f97316' : log.level === 'warn' ? '#f59e0b' : '#94a3b8',
-                }}>
-                  <span style={{ color: '#334155', flexShrink: 0 }}>
-                    {new Date(log.createdAt).toLocaleTimeString()}
-                  </span>
-                  <span style={{
-                    padding: '0 5px', borderRadius: 3, fontSize: 10, alignSelf: 'center', flexShrink: 0,
-                    background: log.level === 'error' ? '#f43f5e20' : log.level === 'tool' ? '#f9731620' : '#1e293b',
-                    color: log.level === 'error' ? '#f43f5e' : log.level === 'tool' ? '#f97316' : '#475569',
-                  }}>
-                    {log.level}
-                  </span>
-                  <span style={{ wordBreak: 'break-all' }}>{log.message}</span>
+              {!selectedTaskId ? (
+                <div style={{ textAlign: 'center', marginTop: 64, color: '#334155' }}>
+                  <div style={{ fontSize: 28, marginBottom: 12 }}>🗂</div>
+                  <div style={{ fontSize: 13, color: '#475569', marginBottom: 6 }}>No task selected</div>
+                  <div style={{ fontSize: 12, color: '#334155' }}>Click a task on the left to view its logs</div>
                 </div>
-              ))}
-              <div ref={logEndRef} />
+              ) : visibleLogs.length === 0 ? (
+                <div style={{ color: '#334155', textAlign: 'center', marginTop: 48 }}>
+                  No logs yet for this task
+                </div>
+              ) : (
+                <>
+                  {visibleLogs.map((log, i) => (
+                    <div key={log.id || i} style={{
+                      display: 'flex', gap: 12, marginBottom: 6, lineHeight: 1.5,
+                      color: log.level === 'error' ? '#f43f5e' : log.level === 'tool' ? '#f97316' : log.level === 'warn' ? '#f59e0b' : '#94a3b8',
+                    }}>
+                      <span style={{ color: '#334155', flexShrink: 0 }}>
+                        {new Date(log.createdAt).toLocaleTimeString()}
+                      </span>
+                      <span style={{
+                        padding: '0 5px', borderRadius: 3, fontSize: 10, alignSelf: 'center', flexShrink: 0,
+                        background: log.level === 'error' ? '#f43f5e20' : log.level === 'tool' ? '#f9731620' : '#1e293b',
+                        color: log.level === 'error' ? '#f43f5e' : log.level === 'tool' ? '#f97316' : '#475569',
+                      }}>
+                        {log.level}
+                      </span>
+                      <span style={{ wordBreak: 'break-all' }}>{log.message}</span>
+                    </div>
+                  ))}
+                  <div ref={logEndRef} />
+                </>
+              )}
             </div>
           )}
 
+          {/* Tasks tab */}
           {activeTab === 'tasks' && (
             <div style={{ flex: 1, overflow: 'auto', padding: 16 }}>
               {tasks.length === 0 ? (
@@ -263,11 +347,22 @@ export default function BotDetail() {
                       {task.result}
                     </div>
                   )}
+                  <button
+                    onClick={() => { setSelectedTaskId(task.id); setActiveTab('logs'); }}
+                    style={{
+                      marginTop: 10, background: 'none', border: '1px solid #1e293b',
+                      color: '#64748b', borderRadius: 6, padding: '4px 10px',
+                      fontSize: 11, cursor: 'pointer', fontFamily: 'DM Mono',
+                    }}
+                  >
+                    View logs →
+                  </button>
                 </div>
               ))}
             </div>
           )}
 
+          {/* Files tab */}
           {activeTab === 'files' && (
             <div style={{ flex: 1, display: 'flex', overflow: 'hidden' }}>
               <div style={{ width: 220, borderRight: '1px solid #1e293b', overflow: 'auto', padding: 12 }}>
@@ -297,6 +392,7 @@ export default function BotDetail() {
             </div>
           )}
 
+          {/* Screenshots tab */}
           {activeTab === 'screenshots' && (
             <div style={{ flex: 1, overflow: 'auto', padding: 16 }}>
               {screenshots.length === 0 ? (
@@ -390,7 +486,7 @@ function QuestionBanner({ question, onAnswer }: { question: HumanQuestion; onAns
           />
           <button onClick={submit} disabled={loading || !answer.trim()} style={{
             background: '#f97316', color: 'white', border: 'none',
-            padding: '8px 16px', borderRadius: 6, fontSize: 13, fontWeight: 600,
+            padding: '8px 16px', borderRadius: 6, fontSize: 13, fontWeight: 600, cursor: 'pointer',
           }}>
             {loading ? '...' : 'Send'}
           </button>
