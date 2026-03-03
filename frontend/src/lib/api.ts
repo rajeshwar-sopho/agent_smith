@@ -136,6 +136,14 @@ export const api = {
   // Memory
   getMemories: (botId: string) => req<Memory[]>(`/bots/${botId}/memories`),
   deleteMemory: (id: string) => req<{ success: boolean }>(`/memories/${id}`, { method: 'DELETE' }),
+
+  // Skills
+  getSkills: () => req<Skill[]>('/skills'),
+  getSkill: (name: string) => req<Skill>(`/skills/${name}`),
+  createSkill: (data: { name: string; description: string; context: string; tags?: string[]; files?: { filename: string; language: string; content: string }[] }) =>
+    req<Skill>('/skills', { method: 'POST', body: JSON.stringify(data) }),
+  deleteSkill: (name: string) => req<{ deleted: boolean }>(`/skills/${name}`, { method: 'DELETE' }),
+  importSkillFromGitHub: (repoUrl: string) => req<Skill>('/skills/import/github', { method: 'POST', body: JSON.stringify({ repoUrl }) }),
 };
 
 export interface ModelInfo {
@@ -167,6 +175,27 @@ export interface Memory {
   content: string;
   keywords: string;
   createdAt: string;
+}
+
+export interface SkillFile {
+  id: string;
+  skillId: string;
+  filename: string;
+  language: string;
+  content: string;
+}
+
+export interface Skill {
+  id: string;
+  name: string;
+  description: string;
+  repoUrl: string | null;
+  context: string;
+  tags: string[];
+  createdAt: string;
+  updatedAt: string;
+  files?: SkillFile[];
+  _count?: { files: number };
 }
 
 export interface SharedProgram {

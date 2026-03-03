@@ -67,11 +67,11 @@ class WebSocketManager {
   }
 
   /** Emit a log event for a bot */
-  log(botId: string, message: string, level = 'info', meta?: unknown) {
+  log(botId: string, taskId: string | null, message: string, level = 'info', meta?: unknown) {
     this.emitToBot(botId, {
       type: 'log',
       botId,
-      payload: { message, level, meta, ts: new Date().toISOString() },
+      payload: { taskId, message, level, meta, ts: new Date().toISOString() },
     });
   }
 

@@ -14,7 +14,7 @@ RUN npm run build
 FROM node:20-alpine AS runner
 
 # Runtime also needs openssl for Prisma query engine
-RUN apk add --no-cache openssl python3
+RUN apk add --no-cache openssl python3 py3-pip
 
 WORKDIR /app
 COPY --from=builder /app/dist ./dist

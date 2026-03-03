@@ -112,6 +112,31 @@ model Memory {
   task Task? @relation(fields: [taskId], references: [id])
 }
 
+// ─── Skills ───────────────────────────────────────────────────────────────────
+
+model Skill {
+  id          String      @id @default(cuid())
+  name        String      @unique  // slug e.g. "stripe-api", "web-scraping"
+  description String
+  repoUrl     String?     // optional GitHub URL
+  context     String      // README/instructions injected into agent prompts
+  tags        String      @default("[]")  // JSON array
+  createdAt   DateTime    @default(now())
+  updatedAt   DateTime    @updatedAt
+
+  files       SkillFile[]
+}
+
+model SkillFile {
+  id        String @id @default(cuid())
+  skillId   String
+  filename  String
+  language  String  @default("python")  // python | javascript | text
+  content   String
+
+  skill     Skill  @relation(fields: [skillId], references: [id], onDelete: Cascade)
+}
+
 // ─── Shared Program Library ───────────────────────────────────────────────────
 
 model SharedProgram {

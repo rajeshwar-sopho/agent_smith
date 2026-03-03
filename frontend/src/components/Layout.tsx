@@ -1,6 +1,6 @@
 import React from 'react';
 import { NavLink } from 'react-router-dom';
-import { Bot, LayoutDashboard, Settings, BookOpen, Sparkles } from 'lucide-react';
+import { Bot, LayoutDashboard, Settings, BookOpen, Sparkles, Zap } from 'lucide-react';
 
 interface SidebarProps {
   children: React.ReactNode;
@@ -41,6 +41,7 @@ export default function Layout({ children }: SidebarProps) {
           <NavItem to="/"        icon={<LayoutDashboard size={16} />} label="Dashboard" />
           <NavItem to="/bots"    icon={<Bot size={16} />}             label="Bots" />
           <NavItem to="/library" icon={<BookOpen size={16} />}        label="Library" />
+          <NavItem to="/skills"  icon={<Zap size={16} />}             label="Skills" />
           <NavItem to="/souls"   icon={<Sparkles size={16} />}        label="Souls" />
         </div>
 

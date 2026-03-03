@@ -71,7 +71,7 @@ async function withRetry<T>(
 
 async function addLog(botId: string, taskId: string, message: string, level = 'info', meta?: unknown) {
   await prisma.log.create({ data: { botId, taskId, message, level, meta: meta ? JSON.stringify(meta) : null } });
-  wsManager.log(botId, message, level, meta);
+  wsManager.log(botId, taskId, message, level, meta);
 }
 
 async function setBotStatus(botId: string, status: string) {
@@ -172,7 +172,7 @@ const createTools = (botId: string, taskId: string) => ({
     if (pkgList.length === 0) return { error: 'No valid package names provided.' };
 
     const cmd = manager === 'pip'
-      ? `pip install --quiet ${pkgList.map(p => `"${p}"`).join(' ')}`
+      ? `python3 -m pip install --quiet --break-system-packages ${pkgList.map(p => `"${p}"`).join(' ')}`
       : `npm install --prefix /app/node_modules_shared ${pkgList.map(p => `"${p}"`).join(' ')}`;
 
     await addLog(botId, taskId, `📦 Installing ${manager} packages: ${pkgList.join(', ')}`, 'tool');
@@ -355,6 +355,78 @@ const createTools = (botId: string, taskId: string) => ({
     };
   },
 
+  list_skills: async () => {
+    const skills = await (prisma as any).skill.findMany({
+      orderBy: { name: 'asc' },
+      include: { files: { select: { filename: true, language: true } } },
+    });
+    return {
+      skills: skills.map((s: any) => ({
+        name: s.name,
+        description: s.description,
+        tags: JSON.parse(s.tags || '[]'),
+        fileCount: s.files.length,
+      })),
+    };
+  },
+
+  load_skill: async (p: { name: string }) => {
+    const skill = await (prisma as any).skill.findUnique({
+      where: { name: p.name },
+      include: { files: true },
+    });
+    if (!skill) return { error: `Skill "${p.name}" not found. Call list_skills to see available skills.` };
+    return {
+      name: skill.name,
+      description: skill.description,
+      context: skill.context,
+      files: skill.files.map((f: any) => ({ filename: f.filename, language: f.language, content: f.content })),
+    };
+  },
+
+  create_skill: async (p: {
+    name: string;
+    description: string;
+    context: string;
+    tags?: string[];
+    files?: Array<{ filename: string; language: string; content: string }>;
+  }) => {
+    const safeName = p.name.toLowerCase().replace(/[^a-z0-9]+/g, '-');
+    const fileEntries = (p.files || []).map(f => ({
+      filename: f.filename,
+      language: f.language || 'python',
+      content: f.content,
+    }));
+    const existing = await (prisma as any).skill.findUnique({ where: { name: safeName } });
+    if (existing) {
+      await (prisma as any).skillFile.deleteMany({ where: { skillId: existing.id } });
+      await (prisma as any).skill.update({
+        where: { name: safeName },
+        data: {
+          description: p.description,
+          context: p.context,
+          tags: JSON.stringify(p.tags || []),
+          updatedAt: new Date(),
+          files: { create: fileEntries },
+        },
+      });
+      await addLog(botId, taskId, `🎯 Updated skill: ${safeName}`, 'tool');
+      return { success: true, action: 'updated', name: safeName };
+    } else {
+      await (prisma as any).skill.create({
+        data: {
+          name: safeName,
+          description: p.description,
+          context: p.context,
+          tags: JSON.stringify(p.tags || []),
+          files: { create: fileEntries },
+        },
+      });
+      await addLog(botId, taskId, `🎯 Created skill: ${safeName}`, 'tool');
+      return { success: true, action: 'created', name: safeName };
+    }
+  },
+
   update_library: async (p: {
     name: string;
     code: string;
@@ -532,6 +604,49 @@ const CLAUDE_TOOLS: Anthropic.Tool[] = [
       required: ['query'],
     },
   },
+  {
+    name: 'list_skills',
+    description: 'List available skills — pre-installed packages of context + code for specific capabilities (e.g. API integrations, data processing pipelines, automation patterns). Call this when starting a task to discover what capabilities are already available.',
+    input_schema: { type: 'object', properties: {} },
+  },
+  {
+    name: 'load_skill',
+    description: 'Load a skill\'s full context (instructions, examples, patterns) and code files. Use this to leverage pre-built capabilities instead of writing from scratch.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        name: { type: 'string', description: 'Skill name from list_skills' },
+      },
+      required: ['name'],
+    },
+  },
+  {
+    name: 'create_skill',
+    description: 'Package reusable code + instructions into a named skill so all agents can discover and use it. Call this when you build a capability that others would benefit from (e.g. an API integration, a data pipeline, a scraping utility). The context should be a SKILL.md explaining what the skill does and how to use it.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        name: { type: 'string', description: 'Slug name e.g. "stripe-api", "csv-processor"' },
+        description: { type: 'string', description: 'One-sentence summary of what this skill does' },
+        context: { type: 'string', description: 'Full SKILL.md content: what the skill does, how to use it, examples, parameters' },
+        tags: { type: 'array', items: { type: 'string' }, description: 'e.g. ["api","payments","stripe"]' },
+        files: {
+          type: 'array',
+          description: 'Code files that implement the skill',
+          items: {
+            type: 'object',
+            properties: {
+              filename: { type: 'string' },
+              language: { type: 'string', enum: ['python', 'javascript', 'shell', 'text'] },
+              content: { type: 'string' },
+            },
+            required: ['filename', 'language', 'content'],
+          },
+        },
+      },
+      required: ['name', 'description', 'context'],
+    },
+  },
 ];
 
 // ─── Claude agent ─────────────────────────────────────────────────────────────
@@ -554,7 +669,12 @@ async function runClaudeAgent(bot: Bot, task: Task, tools: ReturnType<typeof cre
     ? `═══ PAST EXPERIENCE (Retrieved from Memory) ═══\n${formatMemoriesForPrompt(relevantMemories)}\n\nUse these past experiences to avoid repeating mistakes and build on what worked before.\n`
     : '';
 
-  const systemPrompt = `${soulSection}${memoriesSection ? '\n' + memoriesSection : ''}
+  const allSkills = await (prisma as any).skill.findMany({ orderBy: { name: 'asc' }, select: { name: true, description: true } });
+  const skillsSection = allSkills.length > 0
+    ? `═══ AVAILABLE SKILLS ═══\nPre-installed capabilities you can leverage:\n${allSkills.map((s: any) => `  • ${s.name}: ${s.description}`).join('\n')}\n\nCall load_skill("skill-name") to get full instructions and code files for any skill.\n`
+    : '';
+
+  const systemPrompt = `${soulSection}${memoriesSection ? '\n' + memoriesSection : ''}${skillsSection ? '\n' + skillsSection : ''}
 You are an autonomous AI agent named "${bot.name}". You have tools to complete tasks independently.
 Your workspace is a sandboxed directory where you can read/write files and execute code.
 Temp files named run_*.py / run_*.js are auto-cleaned after the task — do not rely on them persisting.
@@ -712,6 +832,9 @@ const GEMINI_TOOL_DECLARATIONS = [
   { name: 'load_from_library', description: 'Load a program from library',    parameters: { type: 'OBJECT', properties: { name: { type: 'STRING' } }, required: ['name'] } },
   { name: 'update_library',    description: 'Update a library program',       parameters: { type: 'OBJECT', properties: { name: { type: 'STRING' }, code: { type: 'STRING' }, description: { type: 'STRING' } }, required: ['name', 'code'] } },
   { name: 'search_memory',     description: 'Search past task memories for relevant experience and learnings', parameters: { type: 'OBJECT', properties: { query: { type: 'STRING' } }, required: ['query'] } },
+  { name: 'list_skills',       description: 'List available skills and pre-installed capabilities',            parameters: { type: 'OBJECT', properties: {} } },
+  { name: 'load_skill',        description: 'Load skill context and code files',                               parameters: { type: 'OBJECT', properties: { name: { type: 'STRING' } }, required: ['name'] } },
+  { name: 'create_skill',      description: 'Package code + SKILL.md context into a named skill for all agents to reuse', parameters: { type: 'OBJECT', properties: { name: { type: 'STRING' }, description: { type: 'STRING' }, context: { type: 'STRING' }, tags: { type: 'ARRAY', items: { type: 'STRING' } } }, required: ['name', 'description', 'context'] } },
 ];
 
 async function runGeminiAgent(bot: Bot, task: Task, tools: ReturnType<typeof createTools>) {
@@ -730,8 +853,12 @@ async function runGeminiAgent(bot: Bot, task: Task, tools: ReturnType<typeof cre
   const memNote = relevantMemories.length > 0
     ? `\n\nPAST EXPERIENCE:\n${formatMemoriesForPrompt(relevantMemories)}\n`
     : '';
+  const allSkills = await (prisma as any).skill.findMany({ orderBy: { name: 'asc' }, select: { name: true, description: true } });
+  const skillsNote = allSkills.length > 0
+    ? `\n\nAVAILABLE SKILLS:\n${allSkills.map((s: any) => `  • ${s.name}: ${s.description}`).join('\n')}\nCall load_skill("skill-name") to get full instructions and code files.`
+    : '';
   const systemNote = `Before writing new code, call list_library to check for existing programs. Save reusable programs to the library. Use search_memory to recall past task learnings when relevant.`;
-  const prompt = `${systemNote}${memNote}\n\nTask: ${task.title}\n\nDescription: ${task.description}`;
+  const prompt = `${systemNote}${memNote}${skillsNote}\n\nTask: ${task.title}\n\nDescription: ${task.description}`;
 
   let response = await withRetry(
     () => chat.sendMessage(prompt),

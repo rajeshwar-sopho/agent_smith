@@ -11,6 +11,7 @@ import modelsRouter from './routes/models';
 import libraryRouter from './routes/library';
 import soulsRouter from './routes/souls';
 import memoryRouter from './routes/memory';
+import skillsRouter from './routes/skills';
 import { wsManager } from './services/websocket';
 import { prisma } from './db/client';
 
@@ -34,6 +35,7 @@ app.use('/api/models', modelsRouter);
 app.use('/api/library', libraryRouter);
 app.use('/api/souls', soulsRouter);
 app.use('/api', memoryRouter);
+app.use('/api/skills', skillsRouter);
 
 // Health check
 app.get('/health', (_, res) => res.json({ ok: true, ts: new Date() }));
