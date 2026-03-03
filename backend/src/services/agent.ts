@@ -7,6 +7,7 @@ import { promisify } from 'util';
 import { Bot, Task } from '@prisma/client';
 import { prisma } from '../db/client';
 import { wsManager } from './websocket';
+import { searchMemories, formatMemoriesForPrompt, saveTaskMemory, summarizeMessages } from './memory';
 
 const execAsync = promisify(exec);
 const WORKSPACE_ROOT = process.env.WORKSPACE_ROOT || path.resolve('./workspaces');
@@ -341,6 +342,19 @@ const createTools = (botId: string, taskId: string) => ({
     };
   },
 
+  search_memory: async (p: { query: string }) => {
+    const memories = await searchMemories(botId, p.query, 5);
+    if (memories.length === 0) return { memories: [], message: 'No relevant memories found.' };
+    return {
+      memories: memories.map(m => ({
+        title: m.title,
+        type: m.type,
+        content: m.content,
+        date: m.createdAt.toISOString().split('T')[0],
+      })),
+    };
+  },
+
   update_library: async (p: {
     name: string;
     code: string;
@@ -507,6 +521,17 @@ const CLAUDE_TOOLS: Anthropic.Tool[] = [
       required: ['name', 'code'],
     },
   },
+  {
+    name: 'search_memory',
+    description: 'Search your episodic memory for relevant past task outcomes, approaches, errors, and learnings. Call this when you need context from previous tasks — e.g., "have I integrated with this API before?", "what packages did I use for this type of task?".',
+    input_schema: {
+      type: 'object',
+      properties: {
+        query: { type: 'string', description: 'Natural language search query, e.g. "web scraping with requests" or "CSV data parsing errors"' },
+      },
+      required: ['query'],
+    },
+  },
 ];
 
 // ─── Claude agent ─────────────────────────────────────────────────────────────
@@ -523,7 +548,13 @@ async function runClaudeAgent(bot: Bot, task: Task, tools: ReturnType<typeof cre
     ? `${soulContent}\n\n---\n\n═══ SOUL GUIDANCE ═══\nThe soul above defines your identity, values, and decision-making style. Embody it in every task.\nYou may call update_soul ONLY when a task creates a drastic, irreversible shift in your purpose or operating environment — not for routine learnings.\n`
     : `═══ SOUL ═══\nNo soul file found. You are operating without a defined identity.\n`;
 
-  const systemPrompt = `${soulSection}
+  // Retrieve relevant memories from past tasks
+  const relevantMemories = await searchMemories(bot.id, `${task.title} ${task.description}`, 3);
+  const memoriesSection = relevantMemories.length > 0
+    ? `═══ PAST EXPERIENCE (Retrieved from Memory) ═══\n${formatMemoriesForPrompt(relevantMemories)}\n\nUse these past experiences to avoid repeating mistakes and build on what worked before.\n`
+    : '';
+
+  const systemPrompt = `${soulSection}${memoriesSection ? '\n' + memoriesSection : ''}
 You are an autonomous AI agent named "${bot.name}". You have tools to complete tasks independently.
 Your workspace is a sandboxed directory where you can read/write files and execute code.
 Temp files named run_*.py / run_*.js are auto-cleaned after the task — do not rely on them persisting.
@@ -594,6 +625,26 @@ Always save important outputs as files in the workspace.`;
       await sleep(INTER_REQUEST_DELAY_MS);
     }
 
+    // Context window summarization: every 7 turns, condense older messages to prevent bloat
+    if (i > 0 && i % 7 === 0 && messages.length > 8) {
+      await addLog(bot.id, task.id, `🧠 Summarizing conversation history to preserve context window...`, 'info');
+      const keepTail = 4; // always keep the last 2 exchanges (4 messages: asst + user pairs)
+      const toSummarize = messages.slice(1, messages.length - keepTail);
+      if (toSummarize.length > 2) {
+        try {
+          const summary = await summarizeMessages(client, bot.model, toSummarize);
+          messages.splice(1, toSummarize.length, {
+            role: 'user',
+            content: `[CONVERSATION SUMMARY — ${toSummarize.length} messages condensed]\n${summary}`,
+          });
+          await addLog(bot.id, task.id, `🧠 Context condensed: ${toSummarize.length} messages → 1 summary block`, 'info');
+        } catch (err) {
+          // Summarization failure is non-fatal
+          await addLog(bot.id, task.id, `⚠️ Context summarization failed, continuing with full history`, 'warn');
+        }
+      }
+    }
+
     const response = await withRetry(
       () => client.messages.create({
         model: bot.model,
@@ -660,6 +711,7 @@ const GEMINI_TOOL_DECLARATIONS = [
   { name: 'list_library',      description: 'List shared library programs',   parameters: { type: 'OBJECT', properties: { tag: { type: 'STRING' }, language: { type: 'STRING' } } } },
   { name: 'load_from_library', description: 'Load a program from library',    parameters: { type: 'OBJECT', properties: { name: { type: 'STRING' } }, required: ['name'] } },
   { name: 'update_library',    description: 'Update a library program',       parameters: { type: 'OBJECT', properties: { name: { type: 'STRING' }, code: { type: 'STRING' }, description: { type: 'STRING' } }, required: ['name', 'code'] } },
+  { name: 'search_memory',     description: 'Search past task memories for relevant experience and learnings', parameters: { type: 'OBJECT', properties: { query: { type: 'STRING' } }, required: ['query'] } },
 ];
 
 async function runGeminiAgent(bot: Bot, task: Task, tools: ReturnType<typeof createTools>) {
@@ -674,8 +726,12 @@ async function runGeminiAgent(bot: Bot, task: Task, tools: ReturnType<typeof cre
     generationConfig: { maxOutputTokens: 4096 },
   });
 
-  const systemNote = `Before writing new code, call list_library to check for existing programs. Save reusable programs to the library.`;
-  const prompt = `${systemNote}\n\nTask: ${task.title}\n\nDescription: ${task.description}`;
+  const relevantMemories = await searchMemories(bot.id, `${task.title} ${task.description}`, 3);
+  const memNote = relevantMemories.length > 0
+    ? `\n\nPAST EXPERIENCE:\n${formatMemoriesForPrompt(relevantMemories)}\n`
+    : '';
+  const systemNote = `Before writing new code, call list_library to check for existing programs. Save reusable programs to the library. Use search_memory to recall past task learnings when relevant.`;
+  const prompt = `${systemNote}${memNote}\n\nTask: ${task.title}\n\nDescription: ${task.description}`;
 
   let response = await withRetry(
     () => chat.sendMessage(prompt),
@@ -760,7 +816,21 @@ export async function runAgentTask(bot: Bot, task: Task) {
     await setTaskStatus(task.id, 'done', { result });
     await setBotStatus(bot.id, 'idle');
     await addLog(bot.id, task.id, `✅ Task complete: ${result.slice(0, 200)}`, 'info');
+
+    // Save memory BEFORE emitting task:done so the frontend sees it on reload
+    await addLog(bot.id, task.id, `🧠 Saving task to memory...`, 'info');
+    const recentLogs = await prisma.log.findMany({
+      where: { taskId: task.id },
+      orderBy: { createdAt: 'desc' },
+      take: 30,
+    });
+    const logsText = recentLogs.map(l => l.message).reverse().join('\n');
+    const savedMemory = await saveTaskMemory(bot, task, result, logsText, 'task_outcome');
+
     wsManager.emitToBot(bot.id, { type: 'task:done', botId: bot.id, payload: { taskId: task.id, result } });
+    if (savedMemory) {
+      wsManager.emitToBot(bot.id, { type: 'memory:saved', botId: bot.id, payload: savedMemory });
+    }
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
     // Still clean up temp files on failure
@@ -768,6 +838,19 @@ export async function runAgentTask(bot: Bot, task: Task) {
     await setTaskStatus(task.id, 'failed', { result: msg });
     await setBotStatus(bot.id, 'failed');
     await addLog(bot.id, task.id, `❌ Task failed: ${msg}`, 'error');
+
+    // Save error pattern BEFORE emitting task:failed
+    const recentLogs = await prisma.log.findMany({
+      where: { taskId: task.id },
+      orderBy: { createdAt: 'desc' },
+      take: 30,
+    });
+    const logsText = recentLogs.map(l => l.message).reverse().join('\n');
+    const savedMemory = await saveTaskMemory(bot, task, msg, logsText, 'error_pattern');
+
     wsManager.emitToBot(bot.id, { type: 'task:failed', botId: bot.id, payload: { taskId: task.id, error: msg } });
+    if (savedMemory) {
+      wsManager.emitToBot(bot.id, { type: 'memory:saved', botId: bot.id, payload: savedMemory });
+    }
   }
 }

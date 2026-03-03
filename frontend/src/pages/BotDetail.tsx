@@ -1,7 +1,7 @@
 import React, { useEffect, useState, useRef, useCallback } from 'react';
 import { useParams, useNavigate } from 'react-router-dom';
 import { ArrowLeft, Send, RefreshCw, Trash2, FolderOpen, FileText, ChevronRight, ChevronDown, Sparkles, ExternalLink } from 'lucide-react';
-import { api, Bot, Task, Log, HumanQuestion, FileNode } from '../lib/api';
+import { api, Bot, Task, Log, HumanQuestion, FileNode, Memory } from '../lib/api';
 import StatusBadge from '../components/StatusBadge';
 import { useSubscribeToBot } from '../hooks/useWebSocket';
 import { formatDistanceToNow } from 'date-fns';
@@ -19,7 +19,9 @@ export default function BotDetail() {
   const [taskInput, setTaskInput] = useState('');
   const [taskDesc, setTaskDesc] = useState('');
   const [submitting, setSubmitting] = useState(false);
-  const [activeTab, setActiveTab] = useState<'logs' | 'tasks' | 'files' | 'screenshots' | 'soul'>('logs');
+  const [memories, setMemories] = useState<Memory[]>([]);
+  const [expandedMemoryId, setExpandedMemoryId] = useState<string | null>(null);
+  const [activeTab, setActiveTab] = useState<'logs' | 'tasks' | 'files' | 'soul' | 'memory' | 'screenshots'>('logs');
   const [selectedTaskId, setSelectedTaskId] = useState<string | null>(null);
   const logEndRef = useRef<HTMLDivElement>(null);
   const [selectedFile, setSelectedFile] = useState<{ path: string; content: string } | null>(null);
@@ -42,13 +44,14 @@ export default function BotDetail() {
 
   const loadAll = useCallback(async () => {
     if (!id) return;
-    const [botData, logsData, tasksData, treeData, screenshotsData, questionsData] = await Promise.all([
+    const [botData, logsData, tasksData, treeData, screenshotsData, questionsData, memoriesData] = await Promise.all([
       api.getBot(id),
       api.getLogs(id),
       api.getTasks(id),
       api.getFileTree(id),
       api.getScreenshots(id),
       api.getQuestions(id),
+      api.getMemories(id),
     ]);
     setBot(botData);
     setLogs(logsData);
@@ -56,6 +59,7 @@ export default function BotDetail() {
     setFileTree(treeData);
     setScreenshots(screenshotsData);
     setPendingQuestions(questionsData.filter(q => q.status === 'pending'));
+    setMemories(memoriesData);
   }, [id]);
 
   useEffect(() => { loadAll(); }, [loadAll]);
@@ -79,6 +83,9 @@ export default function BotDetail() {
     }
     if (msg.type === 'task:done' || msg.type === 'task:failed') {
       loadAll();
+    }
+    if (msg.type === 'memory:saved') {
+      setMemories(prev => [msg.payload as Memory, ...prev]);
     }
   }, [id, loadAll]));
 
@@ -308,7 +315,7 @@ export default function BotDetail() {
             display: 'flex', gap: 0, borderBottom: '1px solid #1e293b',
             background: '#0c0c15', flexShrink: 0, alignItems: 'center',
           }}>
-            {(['logs', 'tasks', 'files', 'soul', 'screenshots'] as const).map(tab => (
+            {(['logs', 'tasks', 'files', 'soul', 'memory', 'screenshots'] as const).map(tab => (
               <button key={tab} onClick={() => setActiveTab(tab)} style={{
                 padding: '12px 18px', border: 'none', background: 'none',
                 color: activeTab === tab ? '#f1f5f9' : '#475569',
@@ -559,6 +566,107 @@ export default function BotDetail() {
                   >
                     <ExternalLink size={13} /> Manage Souls
                   </button>
+                </div>
+              )}
+            </div>
+          )}
+
+          {/* Memory tab */}
+          {activeTab === 'memory' && (
+            <div style={{ flex: 1, overflow: 'auto', padding: 20 }}>
+              <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 16 }}>
+                <div>
+                  <div style={{ fontSize: 15, fontWeight: 700, color: '#f1f5f9' }}>Memory Bank</div>
+                  <div style={{ fontSize: 12, color: '#475569', marginTop: 2 }}>
+                    Auto-saved summaries of past tasks — injected as context for new tasks
+                  </div>
+                </div>
+                <span style={{
+                  fontSize: 11, color: '#8b5cf6', background: '#8b5cf615',
+                  border: '1px solid #8b5cf630', borderRadius: 20, padding: '3px 10px', fontFamily: 'DM Mono',
+                }}>
+                  {memories.length} {memories.length === 1 ? 'memory' : 'memories'}
+                </span>
+              </div>
+
+              {memories.length === 0 ? (
+                <div style={{ textAlign: 'center', padding: '60px 20px' }}>
+                  <div style={{ fontSize: 32, marginBottom: 12, opacity: 0.3 }}>🧠</div>
+                  <div style={{ fontSize: 14, color: '#475569', marginBottom: 6 }}>No memories yet</div>
+                  <div style={{ fontSize: 12, color: '#334155' }}>
+                    Memories are automatically saved when tasks complete
+                  </div>
+                </div>
+              ) : (
+                <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
+                  {memories.map(mem => {
+                    const isExpanded = expandedMemoryId === mem.id;
+                    const typeColor = mem.type === 'error_pattern' ? '#f43f5e' : mem.type === 'insight' ? '#06b6d4' : '#8b5cf6';
+                    const typeBg = mem.type === 'error_pattern' ? '#f43f5e15' : mem.type === 'insight' ? '#06b6d415' : '#8b5cf615';
+                    const typeBorder = mem.type === 'error_pattern' ? '#f43f5e30' : mem.type === 'insight' ? '#06b6d430' : '#8b5cf630';
+                    return (
+                      <div key={mem.id} style={{
+                        background: '#13131c', border: `1px solid ${typeBorder}`,
+                        borderRadius: 10, padding: '14px 16px',
+                      }}>
+                        <div style={{ display: 'flex', alignItems: 'flex-start', gap: 10 }}>
+                          <span style={{
+                            fontSize: 10, fontWeight: 600, color: typeColor,
+                            background: typeBg, border: `1px solid ${typeBorder}`,
+                            borderRadius: 6, padding: '2px 7px', flexShrink: 0, marginTop: 2,
+                            textTransform: 'uppercase', letterSpacing: 0.5, fontFamily: 'DM Mono',
+                          }}>
+                            {mem.type.replace('_', ' ')}
+                          </span>
+                          <div style={{ flex: 1, minWidth: 0 }}>
+                            <div style={{ fontSize: 13, fontWeight: 600, color: '#f1f5f9', marginBottom: 4 }}>
+                              {mem.title}
+                            </div>
+                            <div style={{
+                              fontSize: 12, color: '#94a3b8', lineHeight: 1.6,
+                              ...(isExpanded ? {} : {
+                                display: '-webkit-box',
+                                WebkitLineClamp: 3,
+                                WebkitBoxOrient: 'vertical' as const,
+                                overflow: 'hidden',
+                              }),
+                            }}>
+                              {mem.content}
+                            </div>
+                            {mem.content.length > 200 && (
+                              <button
+                                onClick={() => setExpandedMemoryId(isExpanded ? null : mem.id)}
+                                style={{
+                                  background: 'none', border: 'none', color: typeColor,
+                                  fontSize: 11, cursor: 'pointer', padding: '4px 0 0', fontWeight: 600,
+                                }}
+                              >
+                                {isExpanded ? 'Show less' : 'Show more'}
+                              </button>
+                            )}
+                          </div>
+                          <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'flex-end', gap: 6, flexShrink: 0 }}>
+                            <span style={{ fontSize: 10, color: '#334155', fontFamily: 'DM Mono' }}>
+                              {formatDistanceToNow(new Date(mem.createdAt), { addSuffix: true })}
+                            </span>
+                            <button
+                              onClick={async () => {
+                                await api.deleteMemory(mem.id);
+                                setMemories(prev => prev.filter(m => m.id !== mem.id));
+                              }}
+                              title="Delete memory"
+                              style={{
+                                background: 'none', border: 'none', color: '#334155',
+                                cursor: 'pointer', fontSize: 12, padding: 2,
+                              }}
+                            >
+                              <Trash2 size={12} />
+                            </button>
+                          </div>
+                        </div>
+                      </div>
+                    );
+                  })}
                 </div>
               )}
             </div>

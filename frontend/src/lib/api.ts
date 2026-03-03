@@ -132,6 +132,10 @@ export const api = {
 
   answerQuestion: (id: string, answer: string) =>
     req<HumanQuestion>(`/questions/${id}/answer`, { method: 'POST', body: JSON.stringify({ answer }) }),
+
+  // Memory
+  getMemories: (botId: string) => req<Memory[]>(`/bots/${botId}/memories`),
+  deleteMemory: (id: string) => req<{ success: boolean }>(`/memories/${id}`, { method: 'DELETE' }),
 };
 
 export interface ModelInfo {
@@ -152,6 +156,17 @@ export interface Soul {
   createdAt: string;
   updatedAt: string;
   _count?: { bots: number };
+}
+
+export interface Memory {
+  id: string;
+  botId: string;
+  taskId: string | null;
+  type: 'task_outcome' | 'error_pattern' | 'insight';
+  title: string;
+  content: string;
+  keywords: string;
+  createdAt: string;
 }
 
 export interface SharedProgram {
