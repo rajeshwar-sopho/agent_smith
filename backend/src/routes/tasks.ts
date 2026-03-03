@@ -73,6 +73,32 @@ router.post('/', async (req, res) => {
   }
 });
 
+// POST /api/tasks/:id/retry
+router.post('/:id/retry', async (req, res) => {
+  try {
+    const task = await prisma.task.findUnique({ where: { id: req.params.id } });
+    if (!task) return res.status(404).json({ error: 'Task not found' });
+
+    const bot = await prisma.bot.findUnique({ where: { id: task.botId } });
+    if (!bot) return res.status(404).json({ error: 'Bot not found' });
+
+    // Reset task state and clear old logs for this task
+    const updated = await prisma.task.update({
+      where: { id: task.id },
+      data: { status: 'pending', result: null, tokenUsage: 0 },
+    });
+    await prisma.log.deleteMany({ where: { taskId: task.id } });
+
+    res.json(updated);
+
+    runAgentTask(bot, updated).catch((err) => {
+      console.error('Agent retry error:', err);
+    });
+  } catch (e) {
+    res.status(500).json({ error: String(e) });
+  }
+});
+
 // DELETE /api/tasks/:id
 router.delete('/:id', async (req, res) => {
   try {

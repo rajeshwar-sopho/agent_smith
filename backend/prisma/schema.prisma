@@ -1,3 +1,4 @@
+
 // backend/prisma/schema.prisma
 generator client {
   binaryTargets = ["native", "linux-musl-openssl-3.0.x"]
@@ -9,17 +10,31 @@ datasource db {
   url      = env("DATABASE_URL")
 }
 
-model Bot {
+model Soul {
   id          String   @id @default(cuid())
-  name        String
-  model       String   @default("claude-sonnet-4-6") // full model string e.g. "claude-sonnet-4-5", "gemini-2.0-flash"
-  status      String   @default("idle")   // idle | planning | researching | executing | waiting_for_human | done | failed
-  containerId String?
+  name        String   @unique
+  description String
+  content     String
+  isDefault   Boolean  @default(false)
   createdAt   DateTime @default(now())
   updatedAt   DateTime @updatedAt
 
-  tasks    Task[]
-  logs     Log[]
+  bots        Bot[]
+}
+
+model Bot {
+  id          String   @id @default(cuid())
+  name        String
+  model       String   @default("claude-sonnet-4-6")
+  status      String   @default("idle")
+  containerId String?
+  soulId      String?
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  soul      Soul?          @relation(fields: [soulId], references: [id])
+  tasks     Task[]
+  logs      Log[]
   questions HumanQuestion[]
 }
 
@@ -28,25 +43,25 @@ model Task {
   botId       String
   title       String
   description String
-  status      String   @default("pending") // pending | planning | executing | waiting | done | failed
-  plan        String?  // JSON array of subtasks
+  status      String   @default("pending")
+  plan        String?
   result      String?
   tokenUsage  Int      @default(0)
   createdAt   DateTime @default(now())
   updatedAt   DateTime @updatedAt
 
-  bot      Bot       @relation(fields: [botId], references: [id], onDelete: Cascade)
-  logs     Log[]
-  subtasks Subtask[]
+  bot       Bot            @relation(fields: [botId], references: [id], onDelete: Cascade)
+  logs      Log[]
+  subtasks  Subtask[]
   questions HumanQuestion[]
 }
 
 model Subtask {
-  id       String  @id @default(cuid())
-  taskId   String
-  title    String
-  status   String  @default("pending") // pending | doing | done | failed
-  order    Int
+  id     String @id @default(cuid())
+  taskId String
+  title  String
+  status String @default("pending")
+  order  Int
 
   task Task @relation(fields: [taskId], references: [id], onDelete: Cascade)
 }
@@ -55,9 +70,9 @@ model Log {
   id        String   @id @default(cuid())
   botId     String
   taskId    String?
-  level     String   @default("info") // info | warn | error | tool
+  level     String   @default("info")
   message   String
-  meta      String?  // JSON metadata
+  meta      String?
   createdAt DateTime @default(now())
 
   bot  Bot   @relation(fields: [botId], references: [id], onDelete: Cascade)
@@ -65,16 +80,32 @@ model Log {
 }
 
 model HumanQuestion {
-  id        String   @id @default(cuid())
-  botId     String
-  taskId    String?
-  question  String
-  context   String?
-  answer    String?
-  status    String   @default("pending") // pending | answered
-  createdAt DateTime @default(now())
+  id         String    @id @default(cuid())
+  botId      String
+  taskId     String?
+  question   String
+  context    String?
+  answer     String?
+  status     String    @default("pending")
+  createdAt  DateTime  @default(now())
   answeredAt DateTime?
 
   bot  Bot   @relation(fields: [botId], references: [id], onDelete: Cascade)
   task Task? @relation(fields: [taskId], references: [id])
+}
+
+// ─── Shared Program Library ───────────────────────────────────────────────────
+
+model SharedProgram {
+  id          String   @id @default(cuid())
+  name        String   @unique   // e.g. "csv_parser", "web_scraper"
+  description String
+  language    String             // python | javascript
+  filename    String             // actual file on disk in shared-programs volume
+  tags        String   @default("[]")  // JSON string array e.g. '["csv","data"]'
+  usageCount  Int      @default(0)
+  createdBy   String             // botId
+  updatedBy   String?            // botId of last updater
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
 }

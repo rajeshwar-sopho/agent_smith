@@ -1,23 +1,28 @@
 import { Router } from 'express';
 import { z } from 'zod';
+import path from 'path';
+import fs from 'fs';
 import { prisma } from '../db/client';
 import { createBotContainer, stopBotContainer } from '../services/docker';
 import { wsManager } from '../services/websocket';
 
 const router = Router();
+const WORKSPACE_ROOT = process.env.WORKSPACE_ROOT || path.resolve('./workspaces');
 
 const CreateBotSchema = z.object({
   name: z.string().min(1).max(100),
   model: z.string().default('claude-sonnet-4-5'),
+  soulId: z.string().optional(),
 });
 
 // GET /api/bots
 router.get('/', async (req, res) => {
   try {
-    const bots = await prisma.bot.findMany({
+    const bots = await (prisma.bot as any).findMany({
       orderBy: { createdAt: 'desc' },
       include: {
         _count: { select: { tasks: true } },
+        soul: true,
         tasks: {
           orderBy: { createdAt: 'desc' },
           take: 1,
@@ -34,9 +39,10 @@ router.get('/', async (req, res) => {
 // GET /api/bots/:id
 router.get('/:id', async (req, res) => {
   try {
-    const bot = await prisma.bot.findUnique({
+    const bot = await (prisma.bot as any).findUnique({
       where: { id: req.params.id },
       include: {
+        soul: true,
         tasks: { orderBy: { createdAt: 'desc' } },
         questions: {
           where: { status: 'pending' },
@@ -56,9 +62,18 @@ router.post('/', async (req, res) => {
   try {
     const body = CreateBotSchema.parse(req.body);
 
+    // Resolve soul: use provided soulId or fall back to the default soul
+    let soulId = body.soulId;
+    if (!soulId) {
+      const defaultSoul = await (prisma as any).soul.findFirst({ where: { isDefault: true } });
+      if (defaultSoul) soulId = defaultSoul.id;
+    }
+
     const bot = await prisma.bot.create({
-      data: { name: body.name, model: body.model, status: 'idle' },
+      data: { name: body.name, model: body.model, status: 'idle', ...(soulId && { soulId }) } as any,
     });
+
+    // Soul lives in the DB — loaded at task runtime, not written to workspace
 
     // Start the Docker container
     try {

@@ -23,7 +23,7 @@ export async function createBotContainer(botId: string): Promise<string> {
       `GEMINI_API_KEY=${process.env.GEMINI_API_KEY || ''}`,
     ],
     HostConfig: {
-      Binds: [`${workspaceDir}:/workspace:rw`],
+      Binds: [`${workspaceDir}:/workspace:rw`, `${process.env.SHARED_PROGRAMS_ROOT || "/shared-programs"}:/shared-programs:rw`],
       Memory: 512 * 1024 * 1024, // 512MB
       NanoCpus: 1_000_000_000,   // 1 CPU
       NetworkMode: 'bot-orchestrator_default',

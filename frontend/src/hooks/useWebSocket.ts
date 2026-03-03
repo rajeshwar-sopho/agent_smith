@@ -31,6 +31,12 @@ function getWs(): WebSocket {
   return ws;
 }
 
+function safeSend(ws: WebSocket, data: string) {
+  if (ws.readyState === WebSocket.OPEN) {
+    ws.send(data);
+  }
+}
+
 export function useWebSocket(handler: Handler) {
   const handlerRef = useRef(handler);
   handlerRef.current = handler;
@@ -49,9 +55,7 @@ export function useSubscribeToBot(botId: string | null, handler: Handler) {
     const ws = getWs();
 
     const subscribe = () => {
-      if (ws.readyState === WebSocket.OPEN) {
-        ws.send(JSON.stringify({ type: 'subscribe', botId }));
-      }
+      safeSend(ws, JSON.stringify({ type: 'subscribe', botId }));
     };
 
     if (ws.readyState === WebSocket.OPEN) {
@@ -61,12 +65,8 @@ export function useSubscribeToBot(botId: string | null, handler: Handler) {
     }
 
     return () => {
-      // Always remove the open listener to avoid subscribe firing after unmount
       ws.removeEventListener('open', subscribe);
-      // Only send unsubscribe if the socket is actually open
-      if (ws.readyState === WebSocket.OPEN) {
-        ws.send(JSON.stringify({ type: 'unsubscribe', botId }));
-      }
+      safeSend(ws, JSON.stringify({ type: 'unsubscribe', botId }));
     };
   }, [botId]);
 

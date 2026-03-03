@@ -77,13 +77,6 @@ const MODELS: ModelInfo[] = [
     description: 'Next-gen Pro — preview access, most capable Gemini.',
     tier: 'powerful',
   },
-  {
-    id: 'gemini-2.5-flash-lite',
-    name: 'Gemini 2.5 Flash Lite',
-    provider: 'gemini',
-    description: 'Lightest Gemini 2.5 — lowest latency and cost.',
-    tier: 'fast',
-  },
 ];
 
 // GET /api/models

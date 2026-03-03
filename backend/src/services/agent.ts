@@ -10,6 +10,10 @@ import { wsManager } from './websocket';
 
 const execAsync = promisify(exec);
 const WORKSPACE_ROOT = process.env.WORKSPACE_ROOT || path.resolve('./workspaces');
+const SHARED_PROGRAMS_ROOT = process.env.SHARED_PROGRAMS_ROOT || path.resolve('./shared-programs');
+
+// Ensure shared programs directory exists
+fs.mkdirSync(SHARED_PROGRAMS_ROOT, { recursive: true });
 
 // 5-second pause between every LLM request to stay within free-tier rate limits
 const INTER_REQUEST_DELAY_MS = 5000;
@@ -50,7 +54,6 @@ async function withRetry<T>(
 
       const retryMatch = msg.match(/retry in ([\d.]+)s/i);
       const suggestedMs = retryMatch ? Math.ceil(parseFloat(retryMatch[1]) * 1000) : 0;
-
       const exponential = baseDelayMs * Math.pow(2, attempt - 1);
       const jitter = Math.random() * 1000;
       const delayMs = Math.min(Math.max(suggestedMs, exponential) + jitter, maxDelayMs);
@@ -86,9 +89,42 @@ function workspacePath(botId: string, filePath = ''): string {
   return resolved;
 }
 
+// ─── Workspace cleanup ────────────────────────────────────────────────────────
+
+function cleanupTempFiles(botId: string) {
+  const wsDir = path.join(WORKSPACE_ROOT, botId);
+  if (!fs.existsSync(wsDir)) return 0;
+  const entries = fs.readdirSync(wsDir);
+  const tempPattern = /^run_\d+\.(py|js)$/;
+  let removed = 0;
+  for (const entry of entries) {
+    if (tempPattern.test(entry)) {
+      fs.unlinkSync(path.join(wsDir, entry));
+      removed++;
+    }
+  }
+  return removed;
+}
+
+export function cleanEntireWorkspace(botId: string): number {
+  const wsDir = path.join(WORKSPACE_ROOT, botId);
+  if (!fs.existsSync(wsDir)) return 0;
+  let removed = 0;
+  const removeRecursive = (dir: string) => {
+    for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+      const full = path.join(dir, entry.name);
+      if (entry.isDirectory()) { removeRecursive(full); fs.rmdirSync(full); }
+      else { fs.unlinkSync(full); removed++; }
+    }
+  };
+  removeRecursive(wsDir);
+  return removed;
+}
+
 // ─── Tool implementations ────────────────────────────────────────────────────
 
 const createTools = (botId: string, taskId: string) => ({
+  // ── Workspace tools ────────────────────────────────────────────────────────
   read_file: async (p: { path: string }) => {
     const full = workspacePath(botId, p.path);
     if (!fs.existsSync(full)) return { error: 'File not found' };
@@ -147,15 +183,148 @@ const createTools = (botId: string, taskId: string) => ({
     }
     return { error: 'Timeout waiting for human input' };
   },
+
+  // ── Workspace management ───────────────────────────────────────────────────
+
+  clean_workspace: async (_p: Record<string, never>) => {
+    const removed = cleanEntireWorkspace(botId);
+    await addLog(botId, taskId, `🧹 Workspace cleaned: removed ${removed} file(s)`, 'tool');
+    return { success: true, filesRemoved: removed };
+  },
+
+  update_soul: async (p: { content: string; reason: string }) => {
+    const botRecord = await prisma.bot.findUnique({ where: { id: botId } }) as any;
+    if (botRecord?.soulId) {
+      await (prisma as any).soul.update({ where: { id: botRecord.soulId }, data: { content: p.content } });
+    } else {
+      return { error: 'This bot has no soul assigned — cannot update.' };
+    }
+    await addLog(botId, taskId, `🔮 Soul updated: ${p.reason}`, 'tool');
+    return { success: true, reason: p.reason };
+  },
+
+  // ── Shared Library tools ───────────────────────────────────────────────────
+
+  save_to_library: async (p: {
+    name: string;
+    description: string;
+    code: string;
+    language?: string;
+    tags?: string[];
+  }) => {
+    const lang = p.language || 'python';
+    const ext = lang === 'javascript' ? 'js' : 'py';
+    const safeName = p.name.replace(/[^a-z0-9_]/gi, '_').toLowerCase();
+    const filename = `${safeName}.${ext}`;
+    const filePath = path.join(SHARED_PROGRAMS_ROOT, filename);
+
+    fs.writeFileSync(filePath, p.code, 'utf-8');
+
+    const existing = await prisma.sharedProgram.findUnique({ where: { name: safeName } });
+    if (existing) {
+      await prisma.sharedProgram.update({
+        where: { name: safeName },
+        data: {
+          description: p.description,
+          language: lang,
+          filename,
+          tags: JSON.stringify(p.tags || []),
+          updatedBy: botId,
+        },
+      });
+      await addLog(botId, taskId, `📚 Updated library program: ${safeName}`, 'tool');
+      return { success: true, action: 'updated', name: safeName };
+    } else {
+      await prisma.sharedProgram.create({
+        data: {
+          name: safeName,
+          description: p.description,
+          language: lang,
+          filename,
+          tags: JSON.stringify(p.tags || []),
+          createdBy: botId,
+        },
+      });
+      await addLog(botId, taskId, `📚 Saved new library program: ${safeName}`, 'tool');
+      return { success: true, action: 'created', name: safeName };
+    }
+  },
+
+  list_library: async (p: { tag?: string; language?: string }) => {
+    const all = await prisma.sharedProgram.findMany({ orderBy: { usageCount: 'desc' } });
+    let results = all.map(prog => ({
+      name: prog.name,
+      description: prog.description,
+      language: prog.language,
+      tags: JSON.parse(prog.tags || '[]') as string[],
+      usageCount: prog.usageCount,
+      updatedAt: prog.updatedAt,
+    }));
+    if (p.tag)      results = results.filter(prog => prog.tags.includes(p.tag!));
+    if (p.language) results = results.filter(prog => prog.language === p.language);
+    return { programs: results, total: results.length };
+  },
+
+  load_from_library: async (p: { name: string }) => {
+    const safeName = p.name.replace(/[^a-z0-9_]/gi, '_').toLowerCase();
+    const program = await prisma.sharedProgram.findUnique({ where: { name: safeName } });
+    if (!program) return { error: `Program '${safeName}' not found in library` };
+
+    const filePath = path.join(SHARED_PROGRAMS_ROOT, program.filename);
+    if (!fs.existsSync(filePath)) return { error: `Program file missing for '${safeName}'` };
+
+    const code = fs.readFileSync(filePath, 'utf-8');
+
+    // Increment usage count
+    await prisma.sharedProgram.update({
+      where: { name: safeName },
+      data: { usageCount: { increment: 1 } },
+    });
+
+    await addLog(botId, taskId, `📚 Loaded library program: ${safeName}`, 'tool');
+    return {
+      name: program.name,
+      description: program.description,
+      language: program.language,
+      tags: JSON.parse(program.tags || '[]'),
+      code,
+    };
+  },
+
+  update_library: async (p: {
+    name: string;
+    code: string;
+    description?: string;
+    tags?: string[];
+  }) => {
+    const safeName = p.name.replace(/[^a-z0-9_]/gi, '_').toLowerCase();
+    const program = await prisma.sharedProgram.findUnique({ where: { name: safeName } });
+    if (!program) return { error: `Program '${safeName}' not found in library` };
+
+    const filePath = path.join(SHARED_PROGRAMS_ROOT, program.filename);
+    fs.writeFileSync(filePath, p.code, 'utf-8');
+
+    await prisma.sharedProgram.update({
+      where: { name: safeName },
+      data: {
+        ...(p.description && { description: p.description }),
+        ...(p.tags && { tags: JSON.stringify(p.tags) }),
+        updatedBy: botId,
+      },
+    });
+
+    await addLog(botId, taskId, `📚 Updated library program: ${safeName}`, 'tool');
+    return { success: true, name: safeName };
+  },
 });
 
-// ─── Claude agent ─────────────────────────────────────────────────────────────
+// ─── Claude tools definition ──────────────────────────────────────────────────
 
 const CLAUDE_TOOLS: Anthropic.Tool[] = [
   {
     name: 'read_file',
     description: 'Read a file from the workspace',
-    input_schema: { type: 'object', properties: { path: { type: 'string', description: 'Relative file path' } }, required: ['path'] },
+    input_schema: { type: 'object', properties: { path: { type: 'string' } }, required: ['path'] },
   },
   {
     name: 'write_file',
@@ -169,17 +338,17 @@ const CLAUDE_TOOLS: Anthropic.Tool[] = [
   {
     name: 'list_dir',
     description: 'List files in a workspace directory',
-    input_schema: { type: 'object', properties: { path: { type: 'string', description: 'Directory path (optional)' } } },
+    input_schema: { type: 'object', properties: { path: { type: 'string' } } },
   },
   {
     name: 'execute_code',
-    description: 'Execute Python or JavaScript code and return output',
+    description: 'Execute Python or JavaScript code. Temp files are cleaned up after the task.',
     input_schema: {
       type: 'object',
       properties: {
-        code: { type: 'string', description: 'Code to execute' },
-        language: { type: 'string', enum: ['python', 'javascript'], description: 'Programming language' },
-        filename: { type: 'string', description: 'Optional filename to save the code as' },
+        code: { type: 'string' },
+        language: { type: 'string', enum: ['python', 'javascript'] },
+        filename: { type: 'string', description: 'Optional filename. Defaults to a temp run_*.py file.' },
       },
       required: ['code'],
     },
@@ -190,19 +359,115 @@ const CLAUDE_TOOLS: Anthropic.Tool[] = [
     input_schema: {
       type: 'object',
       properties: {
-        question: { type: 'string', description: 'The question to ask' },
-        context: { type: 'string', description: 'Additional context for the human' },
+        question: { type: 'string' },
+        context: { type: 'string' },
       },
       required: ['question'],
     },
   },
+  {
+    name: 'clean_workspace',
+    description: 'Delete ALL files in your private workspace. Call this when a task is complete and temporary working files are no longer needed. Does not affect the shared library.',
+    input_schema: { type: 'object', properties: {} },
+  },
+  {
+    name: 'update_soul',
+    description: 'Update your soul.md — the file that defines your identity, values and behaviour. Only call this when a task causes a DRASTIC, irreversible shift in your purpose or operating environment. Do NOT call for routine learnings or task-specific insights.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        content: { type: 'string', description: 'Full new Markdown content for soul.md' },
+        reason: { type: 'string', description: 'One-sentence explanation of why this soul update is warranted' },
+      },
+      required: ['content', 'reason'],
+    },
+  },
+  {
+    name: 'save_to_library',
+    description: 'REQUIRED: Save a reusable program to the persistent shared library. All agents share this volume. Call this whenever you write a utility, parser, formatter, calculator, or any reusable script. Use snake_case names.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        name: { type: 'string', description: 'Snake_case name e.g. csv_parser, web_scraper' },
+        description: { type: 'string', description: 'What this program does and how to use it' },
+        code: { type: 'string' },
+        language: { type: 'string', enum: ['python', 'javascript'] },
+        tags: { type: 'array', items: { type: 'string' }, description: 'e.g. ["csv","data","parsing"]' },
+      },
+      required: ['name', 'description', 'code'],
+    },
+  },
+  {
+    name: 'list_library',
+    description: 'REQUIRED FIRST STEP: List programs in the shared library before writing any code. Always call this at task start to discover existing utilities you can reuse.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        tag: { type: 'string', description: 'Filter by tag' },
+        language: { type: 'string', enum: ['python', 'javascript'] },
+      },
+    },
+  },
+  {
+    name: 'load_from_library',
+    description: 'Load a program from the shared library. Returns the full source code. Use this to reuse or extend existing programs instead of rewriting them.',
+    input_schema: {
+      type: 'object',
+      properties: { name: { type: 'string' } },
+      required: ['name'],
+    },
+  },
+  {
+    name: 'update_library',
+    description: 'Update an existing shared library program with improved code, better docs, or new features. You have full permission to improve any shared program — this is encouraged.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        name: { type: 'string' },
+        code: { type: 'string' },
+        description: { type: 'string' },
+        tags: { type: 'array', items: { type: 'string' } },
+      },
+      required: ['name', 'code'],
+    },
+  },
 ];
+
+// ─── Claude agent ─────────────────────────────────────────────────────────────
 
 async function runClaudeAgent(bot: Bot, task: Task, tools: ReturnType<typeof createTools>) {
   const client = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
 
-  const systemPrompt = `You are an autonomous AI agent named "${bot.name}". You have a set of tools to complete tasks.
+  // Load soul content from DB (source of truth — not from workspace file)
+  const soulContent = bot.soulId
+    ? await (prisma as any).soul.findUnique({ where: { id: bot.soulId } }).then((s: any) => s?.content ?? null)
+    : null;
+
+  const soulSection = soulContent
+    ? `${soulContent}\n\n---\n\n═══ SOUL GUIDANCE ═══\nThe soul above defines your identity, values, and decision-making style. Embody it in every task.\nYou may call update_soul ONLY when a task creates a drastic, irreversible shift in your purpose or operating environment — not for routine learnings.\n`
+    : `═══ SOUL ═══\nNo soul file found. You are operating without a defined identity.\n`;
+
+  const systemPrompt = `${soulSection}
+You are an autonomous AI agent named "${bot.name}". You have tools to complete tasks.
 Your workspace is a sandboxed directory where you can read/write files and execute code.
+Temp files named run_*.py / run_*.js are auto-cleaned after the task — do not rely on them persisting.
+
+═══ SHARED LIBRARY (MANDATORY WORKFLOW) ═══
+The shared library is a REAL persistent volume shared across ALL agents. Files saved there survive between tasks and are accessible to every other agent in this system.
+
+You MUST follow this workflow on EVERY task:
+  STEP 1 — Always call list_library at the start of any task that involves writing code.
+  STEP 2 — If a relevant program exists, call load_from_library and build on it instead of rewriting.
+  STEP 3 — If you write code that could be reused (parsers, scrapers, formatters, calculators, utilities), you MUST call save_to_library before finishing. This is not optional.
+  STEP 4 — If you load an existing library program and improve it, you MUST call update_library with the improved version. You have full permission to modify shared library programs — improving shared code is encouraged and expected.
+  STEP 5 — When a task is fully complete and working files are no longer needed, call clean_workspace to delete them from your workspace.
+
+Rules for library programs:
+  - Use snake_case names (e.g. csv_parser, web_scraper, json_formatter)
+  - Write clear descriptions so other agents know when to use the program
+  - Add relevant tags so programs are discoverable
+  - Include usage examples in the code as comments
+
 When you need human input, use the ask_human tool. Be thorough but efficient.
 Always save important outputs as files in the workspace.`;
 
@@ -213,7 +478,6 @@ Always save important outputs as files in the workspace.`;
   let totalTokens = 0;
 
   for (let i = 0; i < 20; i++) {
-    // Pause before every request except the very first
     if (i > 0) {
       await addLog(bot.id, task.id, `⏸ Waiting ${INTER_REQUEST_DELAY_MS / 1000}s before next request...`, 'info');
       await sleep(INTER_REQUEST_DELAY_MS);
@@ -271,19 +535,25 @@ Always save important outputs as files in the workspace.`;
 
 // ─── Gemini agent ─────────────────────────────────────────────────────────────
 
+const GEMINI_TOOL_DECLARATIONS = [
+  { name: 'read_file',         description: 'Read a file',                    parameters: { type: 'OBJECT', properties: { path: { type: 'STRING' } }, required: ['path'] } },
+  { name: 'write_file',        description: 'Write a file',                   parameters: { type: 'OBJECT', properties: { path: { type: 'STRING' }, content: { type: 'STRING' } }, required: ['path', 'content'] } },
+  { name: 'list_dir',          description: 'List directory',                 parameters: { type: 'OBJECT', properties: { path: { type: 'STRING' } } } },
+  { name: 'execute_code',      description: 'Execute code',                   parameters: { type: 'OBJECT', properties: { code: { type: 'STRING' }, language: { type: 'STRING' } }, required: ['code'] } },
+  { name: 'ask_human',         description: 'Ask human a question',           parameters: { type: 'OBJECT', properties: { question: { type: 'STRING' }, context: { type: 'STRING' } }, required: ['question'] } },
+  { name: 'clean_workspace',    description: 'Delete all files in private workspace', parameters: { type: 'OBJECT', properties: {} } },
+  { name: 'update_soul',        description: 'Update soul.md — only for drastic identity shifts', parameters: { type: 'OBJECT', properties: { content: { type: 'STRING' }, reason: { type: 'STRING' } }, required: ['content', 'reason'] } },
+  { name: 'save_to_library',   description: 'Save reusable program to shared library', parameters: { type: 'OBJECT', properties: { name: { type: 'STRING' }, description: { type: 'STRING' }, code: { type: 'STRING' }, language: { type: 'STRING' } }, required: ['name', 'description', 'code'] } },
+  { name: 'list_library',      description: 'List shared library programs',   parameters: { type: 'OBJECT', properties: { tag: { type: 'STRING' }, language: { type: 'STRING' } } } },
+  { name: 'load_from_library', description: 'Load a program from library',    parameters: { type: 'OBJECT', properties: { name: { type: 'STRING' } }, required: ['name'] } },
+  { name: 'update_library',    description: 'Update a library program',       parameters: { type: 'OBJECT', properties: { name: { type: 'STRING' }, code: { type: 'STRING' }, description: { type: 'STRING' } }, required: ['name', 'code'] } },
+];
+
 async function runGeminiAgent(bot: Bot, task: Task, tools: ReturnType<typeof createTools>) {
   const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY || '');
   const model = genAI.getGenerativeModel({
     model: bot.model,
-    tools: [{
-      functionDeclarations: [
-        { name: 'read_file',    description: 'Read a file',    parameters: { type: 'OBJECT', properties: { path: { type: 'STRING' } }, required: ['path'] } },
-        { name: 'write_file',   description: 'Write a file',   parameters: { type: 'OBJECT', properties: { path: { type: 'STRING' }, content: { type: 'STRING' } }, required: ['path', 'content'] } },
-        { name: 'list_dir',     description: 'List directory', parameters: { type: 'OBJECT', properties: { path: { type: 'STRING' } } } },
-        { name: 'execute_code', description: 'Execute code',   parameters: { type: 'OBJECT', properties: { code: { type: 'STRING' }, language: { type: 'STRING' } }, required: ['code'] } },
-        { name: 'ask_human',    description: 'Ask human',      parameters: { type: 'OBJECT', properties: { question: { type: 'STRING' }, context: { type: 'STRING' } }, required: ['question'] } },
-      ] as any,
-    }],
+    tools: [{ functionDeclarations: GEMINI_TOOL_DECLARATIONS as any }],
   });
 
   const chat = model.startChat({
@@ -291,9 +561,9 @@ async function runGeminiAgent(bot: Bot, task: Task, tools: ReturnType<typeof cre
     generationConfig: { maxOutputTokens: 4096 },
   });
 
-  const prompt = `Task: ${task.title}\n\nDescription: ${task.description}`;
+  const systemNote = `Before writing new code, call list_library to check for existing programs. Save reusable programs to the library.`;
+  const prompt = `${systemNote}\n\nTask: ${task.title}\n\nDescription: ${task.description}`;
 
-  // First request — no pre-delay
   let response = await withRetry(
     () => chat.sendMessage(prompt),
     { maxAttempts: 5, baseDelayMs: 2000, maxDelayMs: 60000 },
@@ -309,7 +579,8 @@ async function runGeminiAgent(bot: Bot, task: Task, tools: ReturnType<typeof cre
     const candidate = response.response.candidates?.[0];
     if (!candidate) break;
 
-    const parts = candidate.content.parts;
+    // Guard: Gemini sometimes returns a candidate with no content (empty turn after function call)
+    const parts = candidate.content?.parts ?? [];
 
     for (const part of parts.filter((p: { text?: string }) => p.text)) {
       if ((part as { text: string }).text?.trim()) {
@@ -329,7 +600,6 @@ async function runGeminiAgent(bot: Bot, task: Task, tools: ReturnType<typeof cre
       fnResponses.push({ functionResponse: { name: call.name, response: { result } } });
     }
 
-    // Pause before sending tool results back
     await addLog(bot.id, task.id, `⏸ Waiting ${INTER_REQUEST_DELAY_MS / 1000}s before next request...`, 'info');
     await sleep(INTER_REQUEST_DELAY_MS);
 
@@ -368,12 +638,20 @@ export async function runAgentTask(bot: Bot, task: Task) {
       result = await runClaudeAgent(bot, task, tools);
     }
 
+    // Clean up temp execution files
+    const removed = cleanupTempFiles(bot.id);
+    if (removed && removed > 0) {
+      await addLog(bot.id, task.id, `🧹 Cleaned up ${removed} temp file(s) from workspace`, 'info');
+    }
+
     await setTaskStatus(task.id, 'done', { result });
     await setBotStatus(bot.id, 'idle');
     await addLog(bot.id, task.id, `✅ Task complete: ${result.slice(0, 200)}`, 'info');
     wsManager.emitToBot(bot.id, { type: 'task:done', botId: bot.id, payload: { taskId: task.id, result } });
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
+    // Still clean up temp files on failure
+    cleanupTempFiles(bot.id);
     await setTaskStatus(task.id, 'failed', { result: msg });
     await setBotStatus(bot.id, 'failed');
     await addLog(bot.id, task.id, `❌ Task failed: ${msg}`, 'error');

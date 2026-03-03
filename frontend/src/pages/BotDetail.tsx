@@ -1,10 +1,11 @@
 import React, { useEffect, useState, useRef, useCallback } from 'react';
 import { useParams, useNavigate } from 'react-router-dom';
-import { ArrowLeft, Send, RefreshCw, Trash2, FolderOpen, FileText, ChevronRight, ChevronDown } from 'lucide-react';
+import { ArrowLeft, Send, RefreshCw, Trash2, FolderOpen, FileText, ChevronRight, ChevronDown, Sparkles, ExternalLink } from 'lucide-react';
 import { api, Bot, Task, Log, HumanQuestion, FileNode } from '../lib/api';
 import StatusBadge from '../components/StatusBadge';
 import { useSubscribeToBot } from '../hooks/useWebSocket';
 import { formatDistanceToNow } from 'date-fns';
+import { RotateCcw, Loader2 } from 'lucide-react';
 
 export default function BotDetail() {
   const { id } = useParams<{ id: string }>();
@@ -18,10 +19,26 @@ export default function BotDetail() {
   const [taskInput, setTaskInput] = useState('');
   const [taskDesc, setTaskDesc] = useState('');
   const [submitting, setSubmitting] = useState(false);
-  const [activeTab, setActiveTab] = useState<'logs' | 'tasks' | 'files' | 'screenshots'>('logs');
+  const [activeTab, setActiveTab] = useState<'logs' | 'tasks' | 'files' | 'screenshots' | 'soul'>('logs');
   const [selectedTaskId, setSelectedTaskId] = useState<string | null>(null);
   const logEndRef = useRef<HTMLDivElement>(null);
   const [selectedFile, setSelectedFile] = useState<{ path: string; content: string } | null>(null);
+  const [retryingTaskId, setRetryingTaskId] = useState<string | null>(null);
+  const [cleaningWorkspace, setCleaningWorkspace] = useState(false);
+
+  const handleRetry = async (task: Task, e: React.MouseEvent) => {
+    e.stopPropagation();
+    setRetryingTaskId(task.id);
+    setLogs(prev => prev.filter(l => l.taskId !== task.id)); // clear stale logs immediately
+    try {
+      await api.retryTask(task.id);
+      setSelectedTaskId(task.id);
+      setActiveTab('logs');
+      loadAll();
+    } finally {
+      setRetryingTaskId(null);
+    }
+  };
 
   const loadAll = useCallback(async () => {
     if (!id) return;
@@ -88,6 +105,19 @@ export default function BotDetail() {
     }
   };
 
+  const handleCleanWorkspace = async () => {
+    if (!id || !confirm('Delete all files in this bot\'s workspace? This cannot be undone.')) return;
+    setCleaningWorkspace(true);
+    try {
+      const result = await api.cleanWorkspace(id);
+      setSelectedFile(null);
+      await loadAll();
+      alert(`Workspace cleaned: ${result.filesRemoved} file(s) removed.`);
+    } finally {
+      setCleaningWorkspace(false);
+    }
+  };
+
   const handleFileClick = async (path: string) => {
     if (!id) return;
     const file = await api.getFile(id, path);
@@ -126,7 +156,22 @@ export default function BotDetail() {
           <div style={{ fontSize: 20 }}>{bot.model.startsWith('gemini') ? '✨' : '🧠'}</div>
           <div>
             <div style={{ fontWeight: 700, fontSize: 16, color: '#f1f5f9' }}>{bot.name}</div>
-            <div style={{ fontSize: 11, color: '#475569', fontFamily: 'DM Mono' }}>{bot.model}</div>
+            <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginTop: 2 }}>
+              <span style={{ fontSize: 11, color: '#475569', fontFamily: 'DM Mono' }}>{bot.model}</span>
+              {bot.soul && (
+                <span
+                  onClick={() => setActiveTab('soul')}
+                  style={{
+                    display: 'inline-flex', alignItems: 'center', gap: 4,
+                    fontSize: 10, color: '#a78bfa', background: '#8b5cf615',
+                    border: '1px solid #8b5cf630', padding: '1px 7px', borderRadius: 10,
+                    cursor: 'pointer',
+                  }}
+                >
+                  <Sparkles size={9} /> {bot.soul.name}
+                </span>
+              )}
+            </div>
           </div>
         </div>
         <StatusBadge status={bot.status} />
@@ -218,6 +263,24 @@ export default function BotDetail() {
                   </div>
                   <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
                     <StatusBadge status={task.status} size="sm" />
+                    {['failed', 'done'].includes(task.status) && (
+                      <button
+                        onClick={e => handleRetry(task, e)}
+                        disabled={retryingTaskId === task.id}
+                        style={{
+                          display: 'flex', alignItems: 'center', gap: 5,
+                          background: task.status === 'failed' ? '#f43f5e15' : '#8b5cf615',
+                          border: `1px solid ${task.status === 'failed' ? '#f43f5e40' : '#8b5cf640'}`,
+                          color: task.status === 'failed' ? '#f43f5e' : '#8b5cf6',
+                          borderRadius: 6, padding: '4px 10px',
+                          fontSize: 11, cursor: retryingTaskId === task.id ? 'not-allowed' : 'pointer',
+                        }}
+                      >
+                        {retryingTaskId === task.id
+                          ? <><Loader2 size={11} style={{ animation: 'spin 1s linear infinite' }} /> Retrying...</>
+                          : <><RotateCcw size={11} /> Retry</>}
+                      </button>
+                    )}
                     <span style={{ fontSize: 10, color: '#475569' }}>
                       {formatDistanceToNow(new Date(task.createdAt), { addSuffix: true })}
                     </span>
@@ -245,7 +308,7 @@ export default function BotDetail() {
             display: 'flex', gap: 0, borderBottom: '1px solid #1e293b',
             background: '#0c0c15', flexShrink: 0, alignItems: 'center',
           }}>
-            {(['logs', 'tasks', 'files', 'screenshots'] as const).map(tab => (
+            {(['logs', 'tasks', 'files', 'soul', 'screenshots'] as const).map(tab => (
               <button key={tab} onClick={() => setActiveTab(tab)} style={{
                 padding: '12px 18px', border: 'none', background: 'none',
                 color: activeTab === tab ? '#f1f5f9' : '#475569',
@@ -337,6 +400,24 @@ export default function BotDetail() {
                       <div style={{ fontSize: 12, color: '#475569', marginTop: 2 }}>{task.description}</div>
                     </div>
                     <StatusBadge status={task.status} size="sm" />
+                    {['failed', 'done'].includes(task.status) && (
+                      <button
+                        onClick={e => handleRetry(task, e)}
+                        disabled={retryingTaskId === task.id}
+                        title="Retry task"
+                        style={{
+                          background: task.status === 'failed' ? '#f43f5e15' : '#8b5cf615',
+                          border: `1px solid ${task.status === 'failed' ? '#f43f5e40' : '#8b5cf640'}`,
+                          color: task.status === 'failed' ? '#f43f5e' : '#8b5cf6',
+                          borderRadius: 5, padding: '2px 5px',
+                          display: 'flex', alignItems: 'center', cursor: 'pointer',
+                        }}
+                      >
+                        {retryingTaskId === task.id
+                          ? <Loader2 size={10} style={{ animation: 'spin 1s linear infinite' }} />
+                          : <RotateCcw size={10} />}
+                      </button>
+                    )}
                   </div>
                   {task.result && (
                     <div style={{
@@ -366,8 +447,26 @@ export default function BotDetail() {
           {activeTab === 'files' && (
             <div style={{ flex: 1, display: 'flex', overflow: 'hidden' }}>
               <div style={{ width: 220, borderRight: '1px solid #1e293b', overflow: 'auto', padding: 12 }}>
-                <div style={{ fontSize: 11, color: '#475569', fontFamily: 'DM Mono', textTransform: 'uppercase', letterSpacing: 1, marginBottom: 8 }}>
-                  Workspace
+                <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 8 }}>
+                  <div style={{ fontSize: 11, color: '#475569', fontFamily: 'DM Mono', textTransform: 'uppercase', letterSpacing: 1 }}>
+                    Workspace
+                  </div>
+                  <button
+                    onClick={handleCleanWorkspace}
+                    disabled={cleaningWorkspace || fileTree.length === 0}
+                    title="Clean workspace — delete all files"
+                    style={{
+                      display: 'flex', alignItems: 'center', gap: 4,
+                      background: cleaningWorkspace ? '#1e293b' : '#f43f5e15',
+                      border: '1px solid', borderColor: cleaningWorkspace ? '#334155' : '#f43f5e40',
+                      color: cleaningWorkspace ? '#475569' : '#f43f5e',
+                      padding: '3px 8px', borderRadius: 6, fontSize: 11, cursor: fileTree.length === 0 ? 'not-allowed' : 'pointer',
+                      opacity: fileTree.length === 0 ? 0.4 : 1,
+                    }}
+                  >
+                    {cleaningWorkspace ? <Loader2 size={11} style={{ animation: 'spin 1s linear infinite' }} /> : <Trash2 size={11} />}
+                    {cleaningWorkspace ? 'Cleaning…' : 'Clean'}
+                  </button>
                 </div>
                 {fileTree.length === 0 ? (
                   <div style={{ fontSize: 12, color: '#334155' }}>Empty</div>
@@ -389,6 +488,79 @@ export default function BotDetail() {
                   </div>
                 )}
               </div>
+            </div>
+          )}
+
+          {/* Soul tab */}
+          {activeTab === 'soul' && (
+            <div style={{ flex: 1, overflow: 'auto', padding: 24 }}>
+              {bot.soul ? (
+                <div style={{ maxWidth: 720 }}>
+                  <div style={{
+                    background: '#13131c', border: '1px solid #8b5cf630',
+                    borderRadius: 12, padding: '16px 20px', marginBottom: 20,
+                    display: 'flex', alignItems: 'flex-start', gap: 14,
+                  }}>
+                    <div style={{
+                      width: 36, height: 36, borderRadius: 8, flexShrink: 0,
+                      background: 'linear-gradient(135deg, #8b5cf6, #a78bfa)',
+                      display: 'flex', alignItems: 'center', justifyContent: 'center',
+                    }}>
+                      <Sparkles size={16} color="white" />
+                    </div>
+                    <div style={{ flex: 1, minWidth: 0 }}>
+                      <div style={{ fontSize: 15, fontWeight: 700, color: '#f1f5f9', marginBottom: 3 }}>
+                        {bot.soul.name}
+                      </div>
+                      <div style={{ fontSize: 12, color: '#64748b' }}>{bot.soul.description}</div>
+                      <div style={{ fontSize: 10, color: '#334155', marginTop: 6, fontFamily: 'DM Mono' }}>
+                        Last updated {new Date(bot.soul.updatedAt).toLocaleString()}
+                      </div>
+                    </div>
+                    <button
+                      onClick={() => navigate('/souls')}
+                      style={{
+                        display: 'inline-flex', alignItems: 'center', gap: 6,
+                        background: '#8b5cf615', border: '1px solid #8b5cf640',
+                        color: '#a78bfa', padding: '7px 14px', borderRadius: 8,
+                        fontSize: 12, fontWeight: 600, cursor: 'pointer', flexShrink: 0,
+                      }}
+                    >
+                      <ExternalLink size={12} /> Edit Soul
+                    </button>
+                  </div>
+                  <div style={{ fontSize: 11, color: '#475569', marginBottom: 8, textTransform: 'uppercase', letterSpacing: 0.5, fontFamily: 'DM Mono' }}>
+                    Soul Content
+                  </div>
+                  <pre style={{
+                    background: '#0f172a', border: '1px solid #1e293b', borderRadius: 10,
+                    padding: '20px 24px', fontSize: 13, color: '#94a3b8',
+                    fontFamily: 'DM Mono, monospace', lineHeight: 1.8,
+                    whiteSpace: 'pre-wrap', wordBreak: 'break-word', margin: 0,
+                  }}>
+                    {bot.soul.content}
+                  </pre>
+                </div>
+              ) : (
+                <div style={{ textAlign: 'center', padding: 60 }}>
+                  <Sparkles size={40} style={{ margin: '0 auto 16px', opacity: 0.15 }} />
+                  <div style={{ fontSize: 14, color: '#475569', marginBottom: 6 }}>No soul assigned</div>
+                  <div style={{ fontSize: 12, color: '#334155', marginBottom: 20 }}>
+                    This bot is running without a defined identity or values.
+                  </div>
+                  <button
+                    onClick={() => navigate('/souls')}
+                    style={{
+                      display: 'inline-flex', alignItems: 'center', gap: 7,
+                      background: '#8b5cf615', border: '1px solid #8b5cf640',
+                      color: '#a78bfa', padding: '9px 20px', borderRadius: 8,
+                      fontSize: 13, cursor: 'pointer', fontWeight: 600,
+                    }}
+                  >
+                    <ExternalLink size={13} /> Manage Souls
+                  </button>
+                </div>
+              )}
             </div>
           )}
 

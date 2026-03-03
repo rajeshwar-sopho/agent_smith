@@ -1,6 +1,7 @@
 import React, { useEffect, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
-import { api, ModelInfo } from '../lib/api';
+import { Sparkles, Star } from 'lucide-react';
+import { api, ModelInfo, Soul } from '../lib/api';
 
 interface Props {
   onClose: () => void;
@@ -14,6 +15,8 @@ export default function CreateBotModal({ onClose, onCreated }: Props) {
   const [name, setName] = useState('');
   const [models, setModels] = useState<ModelInfo[]>([]);
   const [selectedModel, setSelectedModel] = useState<string>('claude-sonnet-4-6');
+  const [souls, setSouls] = useState<Soul[]>([]);
+  const [selectedSoulId, setSelectedSoulId] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
   const [loadingModels, setLoadingModels] = useState(true);
   const navigate = useNavigate();
@@ -24,13 +27,23 @@ export default function CreateBotModal({ onClose, onCreated }: Props) {
       const first = m.find(x => x.available);
       if (first) setSelectedModel(first.id);
     }).finally(() => setLoadingModels(false));
+
+    api.getSouls().then(s => {
+      setSouls(s);
+      const def = s.find(x => x.isDefault);
+      if (def) setSelectedSoulId(def.id);
+    });
   }, []);
 
   const handleCreate = async () => {
     if (!name.trim()) return;
     setLoading(true);
     try {
-      const bot = await api.createBot({ name: name.trim(), model: selectedModel });
+      const bot = await api.createBot({
+        name: name.trim(),
+        model: selectedModel,
+        ...(selectedSoulId && { soulId: selectedSoulId }),
+      });
       onCreated();
       navigate(`/bots/${bot.id}`);
     } finally {
@@ -160,6 +173,68 @@ export default function CreateBotModal({ onClose, onCreated }: Props) {
               }}>
                 {selectedInfo.id}
               </span>
+            </div>
+          )}
+        </div>
+
+        {/* Soul picker */}
+        <div style={{ marginBottom: 24 }}>
+          <div style={{ fontSize: 12, color: '#64748b', marginBottom: 10, display: 'flex', alignItems: 'center', gap: 6 }}>
+            <Sparkles size={12} color="#a78bfa" /> Soul
+          </div>
+          {souls.length === 0 ? (
+            <div style={{
+              background: '#0f172a', border: '1px solid #1e293b', borderRadius: 8,
+              padding: '10px 14px', fontSize: 12, color: '#475569',
+            }}>
+              No souls created yet — bot will operate without one.
+            </div>
+          ) : (
+            <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+              <button
+                onClick={() => setSelectedSoulId(null)}
+                style={{
+                  display: 'flex', alignItems: 'center', gap: 10,
+                  padding: '8px 12px', borderRadius: 8, border: '1px solid',
+                  borderColor: selectedSoulId === null ? '#64748b' : '#1e293b',
+                  background: selectedSoulId === null ? '#64748b18' : '#0f0f13',
+                  cursor: 'pointer', textAlign: 'left', width: '100%',
+                }}
+              >
+                <span style={{ fontSize: 14 }}>🫙</span>
+                <div style={{ flex: 1 }}>
+                  <div style={{ fontSize: 12, fontWeight: 600, color: selectedSoulId === null ? '#94a3b8' : '#475569' }}>No soul</div>
+                  <div style={{ fontSize: 11, color: '#334155' }}>Bot runs without a defined identity</div>
+                </div>
+                {selectedSoulId === null && <span style={{ color: '#64748b', fontSize: 14 }}>✓</span>}
+              </button>
+              {souls.map(soul => (
+                <button
+                  key={soul.id}
+                  onClick={() => setSelectedSoulId(soul.id)}
+                  style={{
+                    display: 'flex', alignItems: 'center', gap: 10,
+                    padding: '8px 12px', borderRadius: 8, border: '1px solid',
+                    borderColor: selectedSoulId === soul.id ? '#8b5cf6' : '#1e293b',
+                    background: selectedSoulId === soul.id ? '#8b5cf618' : '#0f0f13',
+                    cursor: 'pointer', textAlign: 'left', width: '100%', transition: 'all 0.15s',
+                  }}
+                >
+                  <Sparkles size={14} color={selectedSoulId === soul.id ? '#a78bfa' : '#334155'} />
+                  <div style={{ flex: 1, minWidth: 0 }}>
+                    <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+                      <span style={{ fontSize: 12, fontWeight: 600, color: selectedSoulId === soul.id ? '#c4b5fd' : '#e2e8f0' }}>
+                        {soul.name}
+                      </span>
+                      {soul.isDefault && <Star size={9} color="#f59e0b" fill="#f59e0b" />}
+                    </div>
+                    <div style={{ fontSize: 11, color: '#475569', marginTop: 1, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                      {soul.description}
+                    </div>
+                  </div>
+                  {selectedSoulId === soul.id && <span style={{ color: '#8b5cf6', fontSize: 14, flexShrink: 0 }}>✓</span>}
+                </button>
+              ))}
             </div>
           )}
         </div>

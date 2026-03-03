@@ -1,6 +1,7 @@
 import { Router } from 'express';
 import path from 'path';
 import fs from 'fs';
+import { cleanEntireWorkspace } from '../services/agent';
 
 const router = Router();
 const WORKSPACE_ROOT = process.env.WORKSPACE_ROOT || path.resolve('./workspaces');
@@ -57,6 +58,16 @@ router.get('/:botId/screenshots', (req, res) => {
     if (!fs.existsSync(dir)) return res.json([]);
     const files = fs.readdirSync(dir).filter((f) => f.match(/\.(png|jpg|jpeg|webp)$/i));
     res.json(files.map((f) => `/workspace/${req.params.botId}/${f}`));
+  } catch (e) {
+    res.status(400).json({ error: String(e) });
+  }
+});
+
+// POST /api/workspace/:botId/clean — delete all files in the bot's workspace
+router.post('/:botId/clean', (req, res) => {
+  try {
+    const removed = cleanEntireWorkspace(req.params.botId);
+    res.json({ cleaned: true, filesRemoved: removed });
   } catch (e) {
     res.status(400).json({ error: String(e) });
   }

@@ -1,6 +1,6 @@
 import React from 'react';
-import { NavLink, useLocation } from 'react-router-dom';
-import { Bot, LayoutDashboard, Settings } from 'lucide-react';
+import { NavLink } from 'react-router-dom';
+import { Bot, LayoutDashboard, Settings, BookOpen, Sparkles } from 'lucide-react';
 
 interface SidebarProps {
   children: React.ReactNode;
@@ -38,8 +38,10 @@ export default function Layout({ children }: SidebarProps) {
 
         {/* Nav items */}
         <div style={{ flex: 1 }}>
-          <NavItem to="/" icon={<LayoutDashboard size={16} />} label="Dashboard" />
-          <NavItem to="/bots" icon={<Bot size={16} />} label="Bots" />
+          <NavItem to="/"        icon={<LayoutDashboard size={16} />} label="Dashboard" />
+          <NavItem to="/bots"    icon={<Bot size={16} />}             label="Bots" />
+          <NavItem to="/library" icon={<BookOpen size={16} />}        label="Library" />
+          <NavItem to="/souls"   icon={<Sparkles size={16} />}        label="Souls" />
         </div>
 
         {/* Bottom */}

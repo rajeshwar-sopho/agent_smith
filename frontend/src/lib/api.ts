@@ -6,6 +6,8 @@ export interface Bot {
   model: 'claude' | 'gemini';
   status: 'idle' | 'planning' | 'researching' | 'executing' | 'waiting_for_human' | 'done' | 'failed';
   containerId: string | null;
+  soulId: string | null;
+  soul?: Soul | null;
   createdAt: string;
   updatedAt: string;
   _count?: { tasks: number };
@@ -82,7 +84,7 @@ export const api = {
   // Bots
   getBots: () => req<Bot[]>('/bots'),
   getBot: (id: string) => req<Bot>(`/bots/${id}`),
-  createBot: (data: { name: string; model: string }) =>
+  createBot: (data: { name: string; model: string; soulId?: string }) =>
     req<Bot>('/bots', { method: 'POST', body: JSON.stringify(data) }),
   deleteBot: (id: string) => req<{ deleted: boolean }>(`/bots/${id}`, { method: 'DELETE' }),
   restartBot: (id: string) => req<Bot>(`/bots/${id}/restart`, { method: 'POST' }),
@@ -93,6 +95,7 @@ export const api = {
   createTask: (data: { botId: string; title: string; description: string }) =>
     req<Task>('/tasks', { method: 'POST', body: JSON.stringify(data) }),
   deleteTask: (id: string) => req<{ deleted: boolean }>(`/tasks/${id}`, { method: 'DELETE' }),
+  retryTask: (id: string) => req<Task>(`/tasks/${id}/retry`, { method: 'POST' }),
 
   // Logs
   getLogs: (botId: string, taskId?: string) =>
@@ -103,10 +106,29 @@ export const api = {
   getFile: (botId: string, path: string) =>
     req<{ path: string; content: string }>(`/workspace/${botId}/file?path=${encodeURIComponent(path)}`),
   getScreenshots: (botId: string) => req<string[]>(`/workspace/${botId}/screenshots`),
+  cleanWorkspace: (botId: string) =>
+    req<{ cleaned: boolean; filesRemoved: number }>(`/workspace/${botId}/clean`, { method: 'POST' }),
 
   // Human questions
   getQuestions: (botId: string) => req<HumanQuestion[]>(`/questions?botId=${botId}`),
   getModels: () => req<ModelInfo[]>('/models'),
+
+  // Library
+  getLibrary: (params?: { tag?: string; language?: string; q?: string }) => {
+    const qs = params ? '?' + new URLSearchParams(Object.fromEntries(Object.entries(params).filter(([,v]) => v))).toString() : '';
+    return req<SharedProgram[]>('/library' + qs);
+  },
+  getLibraryProgram: (name: string) => req<SharedProgram>('/library/' + name),
+  deleteLibraryProgram: (name: string) => req<{ deleted: boolean }>('/library/' + name, { method: 'DELETE' }),
+
+  // Souls
+  getSouls: () => req<Soul[]>('/souls'),
+  getSoul: (id: string) => req<Soul>(`/souls/${id}`),
+  createSoul: (data: { name: string; description: string; content: string; isDefault?: boolean }) =>
+    req<Soul>('/souls', { method: 'POST', body: JSON.stringify(data) }),
+  updateSoul: (id: string, data: Partial<{ name: string; description: string; content: string; isDefault: boolean }>) =>
+    req<Soul>(`/souls/${id}`, { method: 'PATCH', body: JSON.stringify(data) }),
+  deleteSoul: (id: string) => req<{ deleted: boolean }>(`/souls/${id}`, { method: 'DELETE' }),
 
   answerQuestion: (id: string, answer: string) =>
     req<HumanQuestion>(`/questions/${id}/answer`, { method: 'POST', body: JSON.stringify({ answer }) }),
@@ -119,4 +141,30 @@ export interface ModelInfo {
   description: string;
   tier: 'fast' | 'balanced' | 'powerful';
   available: boolean;
+}
+
+export interface Soul {
+  id: string;
+  name: string;
+  description: string;
+  content: string;
+  isDefault: boolean;
+  createdAt: string;
+  updatedAt: string;
+  _count?: { bots: number };
+}
+
+export interface SharedProgram {
+  id: string;
+  name: string;
+  description: string;
+  language: string;
+  filename: string;
+  tags: string[];
+  usageCount: number;
+  createdBy: string;
+  updatedBy: string | null;
+  createdAt: string;
+  updatedAt: string;
+  code?: string | null;
 }
