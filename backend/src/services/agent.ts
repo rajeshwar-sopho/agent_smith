@@ -165,6 +165,56 @@ const createTools = (botId: string, taskId: string) => ({
     }
   },
 
+  install_package: async (p: { packages: string[]; manager?: 'pip' | 'npm' }) => {
+    const manager = p.manager || 'pip';
+    const pkgList = p.packages.filter(pkg => /^[a-zA-Z0-9_\-\.\[\]>=<!, ]+$/.test(pkg));
+    if (pkgList.length === 0) return { error: 'No valid package names provided.' };
+
+    const cmd = manager === 'pip'
+      ? `pip install --quiet ${pkgList.map(p => `"${p}"`).join(' ')}`
+      : `npm install --prefix /app/node_modules_shared ${pkgList.map(p => `"${p}"`).join(' ')}`;
+
+    await addLog(botId, taskId, `📦 Installing ${manager} packages: ${pkgList.join(', ')}`, 'tool');
+    try {
+      const { stdout, stderr } = await execAsync(cmd, { timeout: 120000 });
+      await addLog(botId, taskId, `✅ Installed: ${pkgList.join(', ')}`, 'tool');
+      return { success: true, packages: pkgList, stdout, stderr };
+    } catch (e: unknown) {
+      const err = e as { stdout?: string; stderr?: string; code?: number };
+      return { success: false, stdout: err.stdout || '', stderr: err.stderr || String(e), exitCode: err.code || 1 };
+    }
+  },
+
+  http_request: async (p: { url: string; method?: string; headers?: Record<string, string>; body?: string }) => {
+    // Rewrite localhost / 127.0.0.1 → host.docker.internal so the agent can
+    // reach services running on the host machine from inside the container.
+    const url = p.url
+      .replace(/^(https?:\/\/)localhost(:\d+)?/,  '$1host.docker.internal$2')
+      .replace(/^(https?:\/\/)127\.0\.0\.1(:\d+)?/, '$1host.docker.internal$2');
+
+    const method = (p.method || 'GET').toUpperCase();
+    await addLog(botId, taskId, `🌐 ${method} ${url}`, 'tool');
+    try {
+      const res = await fetch(url, {
+        method,
+        headers: { 'Content-Type': 'application/json', ...(p.headers || {}) },
+        ...(p.body ? { body: p.body } : {}),
+        signal: AbortSignal.timeout(30000),
+      });
+      let text = await res.text();
+      // Gemini rejects any function_response payload containing strings that
+      // look like JSON schema $ref values (e.g. "#/components/schemas/Foo").
+      // Sanitize them so the agent still gets readable content.
+      text = text
+        .replace(/#\/components\/schemas\//g, 'schema:')
+        .replace(/#\/definitions\//g, 'definition:')
+        .replace(/"\$ref"/g, '"ref"');
+      return { status: res.status, ok: res.ok, body: text };
+    } catch (e: unknown) {
+      return { error: String(e) };
+    }
+  },
+
   ask_human: async (p: { question: string; context?: string }) => {
     await addLog(botId, taskId, `Asking human: ${p.question}`, 'tool');
     const q = await prisma.humanQuestion.create({
@@ -354,6 +404,32 @@ const CLAUDE_TOOLS: Anthropic.Tool[] = [
     },
   },
   {
+    name: 'http_request',
+    description: 'Make an HTTP request to any URL. Use this to call APIs, fetch web pages, read OpenAPI specs (e.g. http://localhost:8000/openapi.json), or interact with external services. localhost URLs are automatically routed to the host machine.',
+    input_schema: {
+      type: 'object' as const,
+      properties: {
+        url:     { type: 'string',  description: 'Full URL including protocol e.g. http://localhost:8000/api/users' },
+        method:  { type: 'string',  description: 'HTTP method: GET, POST, PUT, PATCH, DELETE. Default: GET' },
+        headers: { type: 'object',  description: 'Optional request headers as key-value pairs' },
+        body:    { type: 'string',  description: 'Optional request body (JSON string for JSON APIs)' },
+      },
+      required: ['url'],
+    },
+  },
+  {
+    name: 'install_package',
+    description: 'Install Python (pip) or Node (npm) packages so they are available for execute_code. Call this before executing code that requires third-party packages. Examples: requests, pandas, numpy, beautifulsoup4.',
+    input_schema: {
+      type: 'object' as const,
+      properties: {
+        packages: { type: 'array', items: { type: 'string' }, description: 'List of packages to install e.g. ["requests", "pandas>=2.0"]' },
+        manager: { type: 'string', enum: ['pip', 'npm'], description: 'Package manager. Default: pip for Python, npm for JavaScript.' },
+      },
+      required: ['packages'],
+    },
+  },
+  {
     name: 'ask_human',
     description: 'Ask the human operator a question and wait for an answer',
     input_schema: {
@@ -448,9 +524,45 @@ async function runClaudeAgent(bot: Bot, task: Task, tools: ReturnType<typeof cre
     : `═══ SOUL ═══\nNo soul file found. You are operating without a defined identity.\n`;
 
   const systemPrompt = `${soulSection}
-You are an autonomous AI agent named "${bot.name}". You have tools to complete tasks.
+You are an autonomous AI agent named "${bot.name}". You have tools to complete tasks independently.
 Your workspace is a sandboxed directory where you can read/write files and execute code.
 Temp files named run_*.py / run_*.js are auto-cleaned after the task — do not rely on them persisting.
+
+═══ AUTONOMY (CRITICAL) ═══
+You are expected to complete tasks WITHOUT asking the human for help. You have full permission to:
+  - Make reasonable assumptions and proceed. State your assumption in a log, then act on it.
+  - Invent sample/test data when none is provided. Do not ask for it.
+  - Choose file names, formats, structures, and approaches yourself.
+  - Create any helper code, utilities, or scripts you need.
+  - Retry and debug failures on your own before giving up.
+
+NEVER call ask_human for:
+  - File names, variable names, or naming conventions → choose them yourself
+  - Sample or test data → generate realistic synthetic data
+  - Which approach to take → pick the most sensible one and proceed
+  - Confirmation before starting → just start
+  - What format to use → choose a standard format
+
+ONLY call ask_human when ALL of the following are true:
+  1. The task is IMPOSSIBLE to complete without a specific real-world value (e.g. a live API key, a real database URL, a real external account credential)
+  2. You have genuinely no way to make progress without it
+  3. There is no synthetic/mock alternative
+
+When in doubt — make a decision and proceed. A completed task with reasonable assumptions is far better than a blocked task waiting for input.
+
+═══ HTTP REQUESTS & API DISCOVERY ═══
+Use http_request to call external APIs, scrape pages, or interact with services.
+localhost URLs are automatically routed to your host machine — so http://localhost:8000/api/... works.
+When asked to build a skill or client for an API:
+  1. Fetch http://<host>/openapi.json (or /docs, /swagger.json) to read the full API spec
+  2. Read all routes, schemas, and examples from the spec
+  3. Build a complete Python/JS utility covering every endpoint
+  4. Save it to the shared library so all agents can use it
+
+
+Before running code that requires third-party packages, call install_package.
+Examples: install_package(["requests", "beautifulsoup4"]) or install_package(["pandas", "numpy"]).
+Always install before execute_code — never assume packages are pre-installed.
 
 ═══ SHARED LIBRARY (MANDATORY WORKFLOW) ═══
 The shared library is a REAL persistent volume shared across ALL agents. Files saved there survive between tasks and are accessible to every other agent in this system.
@@ -468,7 +580,6 @@ Rules for library programs:
   - Add relevant tags so programs are discoverable
   - Include usage examples in the code as comments
 
-When you need human input, use the ask_human tool. Be thorough but efficient.
 Always save important outputs as files in the workspace.`;
 
   const messages: Anthropic.MessageParam[] = [
@@ -540,6 +651,8 @@ const GEMINI_TOOL_DECLARATIONS = [
   { name: 'write_file',        description: 'Write a file',                   parameters: { type: 'OBJECT', properties: { path: { type: 'STRING' }, content: { type: 'STRING' } }, required: ['path', 'content'] } },
   { name: 'list_dir',          description: 'List directory',                 parameters: { type: 'OBJECT', properties: { path: { type: 'STRING' } } } },
   { name: 'execute_code',      description: 'Execute code',                   parameters: { type: 'OBJECT', properties: { code: { type: 'STRING' }, language: { type: 'STRING' } }, required: ['code'] } },
+  { name: 'http_request',      description: 'Make HTTP requests to APIs or services. localhost is routed to host machine.', parameters: { type: 'OBJECT', properties: { url: { type: 'STRING' }, method: { type: 'STRING' }, headers: { type: 'OBJECT' }, body: { type: 'STRING' } }, required: ['url'] } },
+  { name: 'install_package',   description: 'Install pip or npm packages before running code that needs them', parameters: { type: 'OBJECT', properties: { packages: { type: 'ARRAY', items: { type: 'STRING' } }, manager: { type: 'STRING' } }, required: ['packages'] } },
   { name: 'ask_human',         description: 'Ask human a question',           parameters: { type: 'OBJECT', properties: { question: { type: 'STRING' }, context: { type: 'STRING' } }, required: ['question'] } },
   { name: 'clean_workspace',    description: 'Delete all files in private workspace', parameters: { type: 'OBJECT', properties: {} } },
   { name: 'update_soul',        description: 'Update soul.md — only for drastic identity shifts', parameters: { type: 'OBJECT', properties: { content: { type: 'STRING' }, reason: { type: 'STRING' } }, required: ['content', 'reason'] } },
