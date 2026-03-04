@@ -9,6 +9,7 @@ const STATUS_CONFIG: Record<string, { label: string; color: string; dot: string 
   done:               { label: 'Done',        color: '#10b981', dot: '#10b981' },
   failed:             { label: 'Failed',      color: '#f43f5e', dot: '#f43f5e' },
   pending:            { label: 'Pending',     color: '#64748b', dot: '#64748b' },
+  cancelled:          { label: 'Cancelled',   color: '#94a3b8', dot: '#94a3b8' },
 };
 
 const PULSE_STATUSES = new Set(['planning', 'executing', 'researching']);

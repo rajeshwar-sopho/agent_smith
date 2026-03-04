@@ -1,6 +1,6 @@
 import React, { useEffect, useState, useRef, useCallback } from 'react';
 import { useParams, useNavigate } from 'react-router-dom';
-import { ArrowLeft, Send, RefreshCw, Trash2, FolderOpen, FileText, ChevronRight, ChevronDown, Sparkles, ExternalLink } from 'lucide-react';
+import { ArrowLeft, Send, RefreshCw, Trash2, FileText, ChevronRight, ChevronDown, Sparkles, ExternalLink, Square } from 'lucide-react';
 import { api, Bot, Task, Log, HumanQuestion, FileNode, Memory } from '../lib/api';
 import StatusBadge from '../components/StatusBadge';
 import { useSubscribeToBot } from '../hooks/useWebSocket';
@@ -26,12 +26,25 @@ export default function BotDetail() {
   const logEndRef = useRef<HTMLDivElement>(null);
   const [selectedFile, setSelectedFile] = useState<{ path: string; content: string } | null>(null);
   const [retryingTaskId, setRetryingTaskId] = useState<string | null>(null);
+  const [cancellingTaskId, setCancellingTaskId] = useState<string | null>(null);
+  const [selectedRun, setSelectedRun] = useState(1);
   const [cleaningWorkspace, setCleaningWorkspace] = useState(false);
+
+  const handleCancel = async (task: Task, e: React.MouseEvent) => {
+    e.stopPropagation();
+    setCancellingTaskId(task.id);
+    try {
+      await api.cancelTask(task.id);
+      loadAll();
+    } finally {
+      setCancellingTaskId(null);
+    }
+  };
 
   const handleRetry = async (task: Task, e: React.MouseEvent) => {
     e.stopPropagation();
     setRetryingTaskId(task.id);
-    setLogs(prev => prev.filter(l => l.taskId !== task.id)); // clear stale logs immediately
+    // keep old run logs — they're preserved under their runNumber
     try {
       await api.retryTask(task.id);
       setSelectedTaskId(task.id);
@@ -72,6 +85,7 @@ export default function BotDetail() {
         level: (msg.payload as { level: string }).level as Log['level'],
         message: (msg.payload as { message: string }).message,
         meta: null,
+        runNumber: (msg.payload as { runNumber?: number }).runNumber ?? 1,
         createdAt: (msg.payload as { ts: string }).ts,
       }]);
     }
@@ -81,7 +95,7 @@ export default function BotDetail() {
     if (msg.type === 'human:question') {
       setPendingQuestions(prev => [...prev, msg.payload as HumanQuestion]);
     }
-    if (msg.type === 'task:done' || msg.type === 'task:failed') {
+    if (msg.type === 'task:done' || msg.type === 'task:failed' || msg.type === 'task:cancelled') {
       loadAll();
     }
     if (msg.type === 'memory:saved') {
@@ -136,12 +150,17 @@ export default function BotDetail() {
     setActiveTab('logs');
   };
 
-  // Filter logs by selected task
-  const visibleLogs = selectedTaskId
-    ? logs.filter(l => l.taskId === selectedTaskId)
-    : [];
-
   const selectedTask = tasks.find(t => t.id === selectedTaskId) ?? null;
+
+  // Sync selectedRun to the task's latest run whenever the task or its runCount changes
+  useEffect(() => {
+    if (selectedTask) setSelectedRun(selectedTask.runCount ?? 1);
+  }, [selectedTask?.id, selectedTask?.runCount]);
+
+  // Filter logs by selected task and run
+  const visibleLogs = selectedTaskId
+    ? logs.filter(l => l.taskId === selectedTaskId && (l.runNumber ?? 1) === selectedRun)
+    : [];
 
   if (!bot) return <div style={{ padding: 48, color: '#475569', textAlign: 'center' }}>Loading bot...</div>;
 
@@ -270,7 +289,24 @@ export default function BotDetail() {
                   </div>
                   <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
                     <StatusBadge status={task.status} size="sm" />
-                    {['failed', 'done'].includes(task.status) && (
+                    {['pending', 'planning', 'executing', 'waiting_for_human', 'waiting'].includes(task.status) && (
+                      <button
+                        onClick={e => handleCancel(task, e)}
+                        disabled={cancellingTaskId === task.id}
+                        title="Cancel task"
+                        style={{
+                          display: 'flex', alignItems: 'center', gap: 5,
+                          background: '#f43f5e15', border: '1px solid #f43f5e40',
+                          color: '#f43f5e', borderRadius: 6, padding: '4px 10px',
+                          fontSize: 11, cursor: cancellingTaskId === task.id ? 'not-allowed' : 'pointer',
+                        }}
+                      >
+                        {cancellingTaskId === task.id
+                          ? <><Loader2 size={11} style={{ animation: 'spin 1s linear infinite' }} /> Cancelling...</>
+                          : <><Square size={11} /> Cancel</>}
+                      </button>
+                    )}
+                    {['failed', 'done', 'cancelled'].includes(task.status) && (
                       <button
                         onClick={e => handleRetry(task, e)}
                         disabled={retryingTaskId === task.id}
@@ -354,40 +390,95 @@ export default function BotDetail() {
 
           {/* Logs tab */}
           {activeTab === 'logs' && (
-            <div style={{ flex: 1, overflow: 'auto', padding: 16, fontFamily: 'DM Mono', fontSize: 12 }}>
-              {!selectedTaskId ? (
-                <div style={{ textAlign: 'center', marginTop: 64, color: '#334155' }}>
-                  <div style={{ fontSize: 28, marginBottom: 12 }}>🗂</div>
-                  <div style={{ fontSize: 13, color: '#475569', marginBottom: 6 }}>No task selected</div>
-                  <div style={{ fontSize: 12, color: '#334155' }}>Click a task on the left to view its logs</div>
-                </div>
-              ) : visibleLogs.length === 0 ? (
-                <div style={{ color: '#334155', textAlign: 'center', marginTop: 48 }}>
-                  No logs yet for this task
-                </div>
-              ) : (
-                <>
-                  {visibleLogs.map((log, i) => (
-                    <div key={log.id || i} style={{
-                      display: 'flex', gap: 12, marginBottom: 6, lineHeight: 1.5,
-                      color: log.level === 'error' ? '#f43f5e' : log.level === 'tool' ? '#f97316' : log.level === 'warn' ? '#f59e0b' : '#94a3b8',
-                    }}>
-                      <span style={{ color: '#334155', flexShrink: 0 }}>
-                        {new Date(log.createdAt).toLocaleTimeString()}
-                      </span>
-                      <span style={{
-                        padding: '0 5px', borderRadius: 3, fontSize: 10, alignSelf: 'center', flexShrink: 0,
-                        background: log.level === 'error' ? '#f43f5e20' : log.level === 'tool' ? '#f9731620' : '#1e293b',
-                        color: log.level === 'error' ? '#f43f5e' : log.level === 'tool' ? '#f97316' : '#475569',
-                      }}>
-                        {log.level}
-                      </span>
-                      <span style={{ wordBreak: 'break-all' }}>{log.message}</span>
-                    </div>
+            <div style={{ flex: 1, display: 'flex', flexDirection: 'column', overflow: 'hidden' }}>
+              {/* Run tabs — shown only when task has multiple runs */}
+              {selectedTask && (selectedTask.runCount ?? 1) > 1 && (
+                <div style={{ display: 'flex', gap: 6, padding: '8px 16px', borderBottom: '1px solid #1e293b', flexWrap: 'wrap', flexShrink: 0 }}>
+                  {Array.from({ length: selectedTask.runCount ?? 1 }, (_, i) => i + 1).map(run => (
+                    <button
+                      key={run}
+                      onClick={() => setSelectedRun(run)}
+                      style={{
+                        padding: '3px 10px', borderRadius: 20, fontSize: 11, fontWeight: 600,
+                        fontFamily: 'DM Mono, monospace', cursor: 'pointer',
+                        background: selectedRun === run ? '#8b5cf620' : 'transparent',
+                        border: `1px solid ${selectedRun === run ? '#8b5cf6' : '#334155'}`,
+                        color: selectedRun === run ? '#8b5cf6' : '#475569',
+                      }}
+                    >
+                      Run {run}{run === (selectedTask.runCount ?? 1) ? ' ●' : ''}
+                    </button>
                   ))}
-                  <div ref={logEndRef} />
-                </>
+                </div>
               )}
+              <div style={{ flex: 1, overflow: 'auto', padding: 16, fontFamily: 'DM Mono', fontSize: 12 }}>
+                {!selectedTaskId ? (
+                  <div style={{ textAlign: 'center', marginTop: 64, color: '#334155' }}>
+                    <div style={{ fontSize: 28, marginBottom: 12 }}>🗂</div>
+                    <div style={{ fontSize: 13, color: '#475569', marginBottom: 6 }}>No task selected</div>
+                    <div style={{ fontSize: 12, color: '#334155' }}>Click a task on the left to view its logs</div>
+                  </div>
+                ) : visibleLogs.length === 0 ? (
+                  <div style={{ color: '#334155', textAlign: 'center', marginTop: 48 }}>
+                    No logs yet for this run
+                  </div>
+                ) : (
+                  <>
+                    {visibleLogs.map((log, i) => {
+                      if (log.level === 'plan') {
+                        return (
+                          <div key={log.id || i} style={{
+                            marginBottom: 12, padding: '10px 14px', borderRadius: 8,
+                            background: '#0ea5e910', border: '1px solid #0ea5e930',
+                          }}>
+                            <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 8 }}>
+                              <span style={{ color: '#334155', fontSize: 11, flexShrink: 0 }}>
+                                {new Date(log.createdAt).toLocaleTimeString()}
+                              </span>
+                              <span style={{
+                                padding: '1px 6px', borderRadius: 3, fontSize: 10, fontWeight: 700,
+                                background: '#0ea5e920', color: '#0ea5e9', border: '1px solid #0ea5e940',
+                              }}>
+                                plan
+                              </span>
+                              <span style={{ color: '#0ea5e9', fontSize: 11, fontWeight: 600 }}>Execution Plan</span>
+                            </div>
+                            <div style={{ color: '#cbd5e1', lineHeight: 1.8 }}>
+                              {log.message.split('\n').map((line, li) => (
+                                <div key={li} style={{ display: 'flex', gap: 8, alignItems: 'flex-start' }}>
+                                  <span style={{ color: '#0ea5e9', flexShrink: 0, fontWeight: 600, minWidth: 20 }}>
+                                    {line.match(/^\d+\./) ? '' : ''}
+                                  </span>
+                                  <span>{line}</span>
+                                </div>
+                              ))}
+                            </div>
+                          </div>
+                        );
+                      }
+                      return (
+                        <div key={log.id || i} style={{
+                          display: 'flex', gap: 12, marginBottom: 6, lineHeight: 1.5,
+                          color: log.level === 'error' ? '#f43f5e' : log.level === 'tool' ? '#f97316' : log.level === 'warn' ? '#f59e0b' : '#94a3b8',
+                        }}>
+                          <span style={{ color: '#334155', flexShrink: 0 }}>
+                            {new Date(log.createdAt).toLocaleTimeString()}
+                          </span>
+                          <span style={{
+                            padding: '0 5px', borderRadius: 3, fontSize: 10, alignSelf: 'center', flexShrink: 0,
+                            background: log.level === 'error' ? '#f43f5e20' : log.level === 'tool' ? '#f9731620' : '#1e293b',
+                            color: log.level === 'error' ? '#f43f5e' : log.level === 'tool' ? '#f97316' : '#475569',
+                          }}>
+                            {log.level}
+                          </span>
+                          <span style={{ wordBreak: 'break-all' }}>{log.message}</span>
+                        </div>
+                      );
+                    })}
+                    <div ref={logEndRef} />
+                  </>
+                )}
+              </div>
             </div>
           )}
 

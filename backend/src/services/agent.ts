@@ -8,6 +8,7 @@ import { Bot, Task } from '@prisma/client';
 import { prisma } from '../db/client';
 import { wsManager } from './websocket';
 import { searchMemories, formatMemoriesForPrompt, saveTaskMemory, summarizeMessages } from './memory';
+import { createBotContainer, stopBotContainer } from './docker';
 
 const execAsync = promisify(exec);
 const WORKSPACE_ROOT = process.env.WORKSPACE_ROOT || path.resolve('./workspaces');
@@ -15,6 +16,22 @@ const SHARED_PROGRAMS_ROOT = process.env.SHARED_PROGRAMS_ROOT || path.resolve('.
 
 // Ensure shared programs directory exists
 fs.mkdirSync(SHARED_PROGRAMS_ROOT, { recursive: true });
+
+// ─── Task cancellation registry ───────────────────────────────────────────────
+
+const runningTasks = new Map<string, AbortController>();
+// Maps taskId → current run number (set at task start, used by addLog)
+const taskRunNumbers = new Map<string, number>();
+
+export function cancelTask(taskId: string): boolean {
+  const controller = runningTasks.get(taskId);
+  if (controller) {
+    controller.abort();
+    runningTasks.delete(taskId);
+    return true;
+  }
+  return false;
+}
 
 // 5-second pause between every LLM request to stay within free-tier rate limits
 const INTER_REQUEST_DELAY_MS = 5000;
@@ -70,8 +87,9 @@ async function withRetry<T>(
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
 async function addLog(botId: string, taskId: string, message: string, level = 'info', meta?: unknown) {
-  await prisma.log.create({ data: { botId, taskId, message, level, meta: meta ? JSON.stringify(meta) : null } });
-  wsManager.log(botId, taskId, message, level, meta);
+  const runNumber = taskRunNumbers.get(taskId) ?? 1;
+  await prisma.log.create({ data: { botId, taskId, message, level, meta: meta ? JSON.stringify(meta) : null, runNumber } as any });
+  wsManager.log(botId, taskId, message, level, meta, runNumber);
 }
 
 async function setBotStatus(botId: string, status: string) {
@@ -124,7 +142,7 @@ export function cleanEntireWorkspace(botId: string): number {
 
 // ─── Tool implementations ────────────────────────────────────────────────────
 
-const createTools = (botId: string, taskId: string) => ({
+const createTools = (botId: string, taskId: string, signal: AbortSignal) => ({
   // ── Workspace tools ────────────────────────────────────────────────────────
   read_file: async (p: { path: string }) => {
     const full = workspacePath(botId, p.path);
@@ -216,6 +234,13 @@ const createTools = (botId: string, taskId: string) => ({
     }
   },
 
+  log_plan: async (p: { steps: string[] }) => {
+    const planText = p.steps.map((s, i) => `${i + 1}. ${s}`).join('\n');
+    await prisma.task.update({ where: { id: taskId }, data: { plan: planText } });
+    await addLog(botId, taskId, planText, 'plan');
+    return { success: true };
+  },
+
   ask_human: async (p: { question: string; context?: string }) => {
     await addLog(botId, taskId, `Asking human: ${p.question}`, 'tool');
     const q = await prisma.humanQuestion.create({
@@ -225,6 +250,7 @@ const createTools = (botId: string, taskId: string) => ({
     wsManager.emitToBot(botId, { type: 'human:question', botId, payload: q });
 
     for (let i = 0; i < 600; i++) {
+      if (signal.aborted) return { error: 'Task cancelled' };
       await sleep(1000);
       const updated = await prisma.humanQuestion.findUnique({ where: { id: q.id } });
       if (updated?.status === 'answered') {
@@ -452,11 +478,133 @@ const createTools = (botId: string, taskId: string) => ({
     await addLog(botId, taskId, `📚 Updated library program: ${safeName}`, 'tool');
     return { success: true, name: safeName };
   },
+
+  // ── Agent collaboration ────────────────────────────────────────────────────
+
+  list_bots: async () => {
+    const bots = await prisma.bot.findMany({
+      orderBy: { name: 'asc' },
+      select: { id: true, name: true, model: true, status: true },
+    });
+    return {
+      bots: bots
+        .filter(b => b.id !== botId)
+        .map(b => ({ id: b.id, name: b.name, model: b.model, status: b.status })),
+    };
+  },
+
+  delegate_task: async (p: {
+    botId: string;
+    title: string;
+    description: string;
+    wait?: boolean;
+    timeoutSeconds?: number;
+  }) => {
+    const targetBot = await prisma.bot.findUnique({ where: { id: p.botId } });
+    if (!targetBot) return { error: `Bot "${p.botId}" not found. Call list_bots to see available agents.` };
+    if (targetBot.status !== 'idle') {
+      return { error: `Bot "${targetBot.name}" is currently ${targetBot.status}. Wait until it is idle before delegating.` };
+    }
+
+    const newTask = await prisma.task.create({
+      data: { botId: p.botId, title: p.title, description: p.description, status: 'pending' },
+    });
+
+    await addLog(botId, taskId, `📨 Delegated to ${targetBot.name}: "${p.title}"`, 'tool');
+
+    // Fire off the delegated task in background
+    runAgentTask(targetBot, newTask).catch(err => console.error('Delegated task error:', err));
+
+    if (p.wait === false) {
+      return { success: true, taskId: newTask.id, botName: targetBot.name, message: 'Task delegated. Not waiting for result.' };
+    }
+
+    // Poll until done / failed / cancelled / timeout
+    const timeoutMs = (p.timeoutSeconds ?? 300) * 1000;
+    const deadline = Date.now() + timeoutMs;
+    while (Date.now() < deadline) {
+      if (signal.aborted) return { error: 'Parent task was cancelled while waiting for delegated task.' };
+      await sleep(3000);
+      const updated = await prisma.task.findUnique({ where: { id: newTask.id } });
+      if (!updated) return { error: 'Delegated task record disappeared.' };
+      if (updated.status === 'done')      return { success: true,  taskId: newTask.id, result: updated.result };
+      if (updated.status === 'failed')    return { success: false, taskId: newTask.id, error: updated.result };
+      if (updated.status === 'cancelled') return { success: false, taskId: newTask.id, error: 'Delegated task was cancelled.' };
+    }
+    return { error: `Delegated task timed out after ${p.timeoutSeconds ?? 300}s. Task ID: ${newTask.id} — check its logs separately.` };
+  },
+
+  spawn_agent: async (p: { name: string; model?: string; soulId?: string }) => {
+    const selfBot = await prisma.bot.findUnique({ where: { id: botId } });
+    const model = p.model || selfBot?.model || 'claude-sonnet-4-6';
+
+    // Resolve soulId: use provided, or fall back to default soul
+    let resolvedSoulId = p.soulId;
+    if (!resolvedSoulId) {
+      const defaultSoul = await (prisma as any).soul.findFirst({ where: { isDefault: true } });
+      if (defaultSoul) resolvedSoulId = defaultSoul.id;
+    }
+
+    const newBot = await prisma.bot.create({
+      data: { name: p.name, model, status: 'idle', ...(resolvedSoulId && { soulId: resolvedSoulId }) } as any,
+    });
+
+    // Start Docker container (best-effort — don't fail if Docker unavailable)
+    try {
+      const containerId = await createBotContainer(newBot.id);
+      await prisma.bot.update({ where: { id: newBot.id }, data: { containerId } });
+      (newBot as any).containerId = containerId;
+    } catch (dockerErr) {
+      console.error('Docker error spawning bot (continuing):', dockerErr);
+    }
+
+    wsManager.broadcast({ type: 'bot:created', botId: newBot.id, payload: newBot });
+    await addLog(botId, taskId, `🤖 Spawned new agent: ${p.name} (${model}) — ID: ${newBot.id}`, 'tool');
+    return { success: true, id: newBot.id, name: newBot.name, model: newBot.model };
+  },
+
+  kill_agent: async (p: { botId: string }) => {
+    if (p.botId === botId) return { error: 'An agent cannot kill itself.' };
+
+    const target = await prisma.bot.findUnique({ where: { id: p.botId } });
+    if (!target) return { error: `Bot "${p.botId}" not found. Call list_bots to see available agents.` };
+
+    // Cancel all active tasks for this bot
+    const activeTasks = await prisma.task.findMany({
+      where: { botId: p.botId, status: { in: ['pending', 'planning', 'executing', 'waiting_for_human', 'waiting'] } },
+    });
+    for (const t of activeTasks) {
+      cancelTask(t.id);
+      await prisma.task.update({ where: { id: t.id }, data: { status: 'cancelled', result: 'Agent killed' } });
+    }
+
+    // Stop and remove Docker container
+    if ((target as any).containerId) {
+      await stopBotContainer((target as any).containerId);
+    }
+
+    // Delete bot (cascades to tasks, logs, questions, memories)
+    await prisma.bot.delete({ where: { id: p.botId } });
+    wsManager.broadcast({ type: 'bot:deleted', botId: p.botId, payload: { id: p.botId } });
+    await addLog(botId, taskId, `💀 Killed agent: ${target.name} (${p.botId})`, 'tool');
+    return { success: true, killed: target.name };
+  },
 });
 
 // ─── Claude tools definition ──────────────────────────────────────────────────
 
 const CLAUDE_TOOLS: Anthropic.Tool[] = [
+  {
+    name: 'log_plan',
+    description: 'MANDATORY FIRST CALL: Before taking any other action, write your step-by-step execution plan. This registers your plan in the task log so it is visible to the human. You MUST call this before calling any other tool.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        steps: { type: 'array', items: { type: 'string' }, description: 'Ordered list of steps you will take to complete this task' },
+      },
+      required: ['steps'],
+    },
+  },
   {
     name: 'read_file',
     description: 'Read a file from the workspace',
@@ -647,11 +795,55 @@ const CLAUDE_TOOLS: Anthropic.Tool[] = [
       required: ['name', 'description', 'context'],
     },
   },
+  {
+    name: 'list_bots',
+    description: 'List all other agents in this system with their current status. Call this before delegating a task to find an available (idle) agent to assign work to.',
+    input_schema: { type: 'object', properties: {} },
+  },
+  {
+    name: 'delegate_task',
+    description: 'Assign a task to another agent. Use this to parallelize work, hand off to a specialist agent, or break a large task into subtasks. Call list_bots first to find an idle agent. Set wait=true to block until the delegated task finishes and receive its result; set wait=false to fire-and-forget and continue your own work.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        botId:          { type: 'string', description: 'ID of the target bot from list_bots' },
+        title:          { type: 'string', description: 'Short title for the delegated task' },
+        description:    { type: 'string', description: 'Full instructions for the delegated agent' },
+        wait:           { type: 'boolean', description: 'If true, block until the task completes and return its result. Default: true. Set to false only for fire-and-forget tasks where you do not need the result.' },
+        timeoutSeconds: { type: 'number', description: 'Max seconds to wait when wait=true. Default: 300.' },
+      },
+      required: ['botId', 'title', 'description'],
+    },
+  },
+  {
+    name: 'spawn_agent',
+    description: 'Create and start a new agent. Use this when you need a fresh agent for a long-running background job, a specialist role, or to expand the pool of available workers. The new agent starts idle and can immediately receive delegated tasks.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        name:   { type: 'string', description: 'Display name for the new agent, e.g. "Data Analyst Bot"' },
+        model:  { type: 'string', description: 'Model ID to use. Defaults to same model as you. e.g. "claude-sonnet-4-6"' },
+        soulId: { type: 'string', description: 'Optional soul ID to assign. Omit to use the default soul.' },
+      },
+      required: ['name'],
+    },
+  },
+  {
+    name: 'kill_agent',
+    description: 'Permanently shut down and delete another agent. Cancels all its active tasks, stops its container, and removes it from the system. Use with care — this is irreversible. You cannot kill yourself.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        botId: { type: 'string', description: 'ID of the agent to kill, from list_bots' },
+      },
+      required: ['botId'],
+    },
+  },
 ];
 
 // ─── Claude agent ─────────────────────────────────────────────────────────────
 
-async function runClaudeAgent(bot: Bot, task: Task, tools: ReturnType<typeof createTools>) {
+async function runClaudeAgent(bot: Bot, task: Task, tools: ReturnType<typeof createTools>, signal: AbortSignal) {
   const client = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
 
   // Load soul content from DB (source of truth — not from workspace file)
@@ -678,6 +870,9 @@ async function runClaudeAgent(bot: Bot, task: Task, tools: ReturnType<typeof cre
 You are an autonomous AI agent named "${bot.name}". You have tools to complete tasks independently.
 Your workspace is a sandboxed directory where you can read/write files and execute code.
 Temp files named run_*.py / run_*.js are auto-cleaned after the task — do not rely on them persisting.
+
+═══ PLANNING (MANDATORY FIRST STEP) ═══
+Before calling ANY other tool, you MUST call log_plan with a numbered list of the steps you will take to complete this task. This plan is logged and visible to the human. No exceptions — log_plan is always the very first tool call.
 
 ═══ AUTONOMY (CRITICAL) ═══
 You are expected to complete tasks WITHOUT asking the human for help. You have full permission to:
@@ -731,7 +926,37 @@ Rules for library programs:
   - Add relevant tags so programs are discoverable
   - Include usage examples in the code as comments
 
-Always save important outputs as files in the workspace.`;
+Always save important outputs as files in the workspace.
+
+═══ AGENT COLLABORATION ═══
+You are part of a multi-agent system. You can discover, create, delegate to, and destroy other agents.
+
+  list_bots     — see all agents and their current status (idle / executing / etc.)
+  delegate_task — assign a task to another idle agent
+  spawn_agent   — create a brand-new agent (starts idle, ready for tasks)
+  kill_agent    — permanently shut down and delete another agent (irreversible)
+
+When to delegate:
+  - A task has clearly separable subtasks that can run in parallel → delegate each to a different agent
+  - A task requires a specialist capability another bot may be configured for → delegate to it
+  - You are already busy with your primary task and need side work done → delegate
+
+When to spawn:
+  - No idle agents are available but more parallel workers are needed
+  - You need a specialist agent with a specific role for ongoing work
+  - A subtask is large enough to warrant a dedicated worker
+
+When to kill:
+  - A temporary agent you spawned has finished its purpose
+  - An agent is stuck or no longer needed
+  - You are cleaning up after a multi-agent workflow
+
+wait=true  → DEFAULT. Block until the delegated task finishes; you get back the full result. Use this when you need the output.
+wait=false → Fire-and-forget. Only use this when you explicitly do not need the result and will not check on the task.
+
+IMPORTANT: When you spawn an agent and delegate a task to it, always use wait=true (or omit wait entirely) so you receive the result before deciding to kill the agent.
+
+Never delegate back to yourself. Always call list_bots to check status before delegating — only idle bots can accept tasks.`;
 
   const messages: Anthropic.MessageParam[] = [
     { role: 'user', content: `Task: ${task.title}\n\nDescription: ${task.description}` },
@@ -740,10 +965,14 @@ Always save important outputs as files in the workspace.`;
   let totalTokens = 0;
 
   for (let i = 0; i < 20; i++) {
+    if (signal.aborted) throw new Error('Task cancelled');
+
     if (i > 0) {
       await addLog(bot.id, task.id, `⏸ Waiting ${INTER_REQUEST_DELAY_MS / 1000}s before next request...`, 'info');
       await sleep(INTER_REQUEST_DELAY_MS);
     }
+
+    if (signal.aborted) throw new Error('Task cancelled');
 
     // Context window summarization: every 7 turns, condense older messages to prevent bloat
     if (i > 0 && i % 7 === 0 && messages.length > 8) {
@@ -818,6 +1047,7 @@ Always save important outputs as files in the workspace.`;
 // ─── Gemini agent ─────────────────────────────────────────────────────────────
 
 const GEMINI_TOOL_DECLARATIONS = [
+  { name: 'log_plan',          description: 'MANDATORY FIRST CALL: Write your step-by-step execution plan before any other action',  parameters: { type: 'OBJECT', properties: { steps: { type: 'ARRAY', items: { type: 'STRING' } } }, required: ['steps'] } },
   { name: 'read_file',         description: 'Read a file',                    parameters: { type: 'OBJECT', properties: { path: { type: 'STRING' } }, required: ['path'] } },
   { name: 'write_file',        description: 'Write a file',                   parameters: { type: 'OBJECT', properties: { path: { type: 'STRING' }, content: { type: 'STRING' } }, required: ['path', 'content'] } },
   { name: 'list_dir',          description: 'List directory',                 parameters: { type: 'OBJECT', properties: { path: { type: 'STRING' } } } },
@@ -835,9 +1065,13 @@ const GEMINI_TOOL_DECLARATIONS = [
   { name: 'list_skills',       description: 'List available skills and pre-installed capabilities',            parameters: { type: 'OBJECT', properties: {} } },
   { name: 'load_skill',        description: 'Load skill context and code files',                               parameters: { type: 'OBJECT', properties: { name: { type: 'STRING' } }, required: ['name'] } },
   { name: 'create_skill',      description: 'Package code + SKILL.md context into a named skill for all agents to reuse', parameters: { type: 'OBJECT', properties: { name: { type: 'STRING' }, description: { type: 'STRING' }, context: { type: 'STRING' }, tags: { type: 'ARRAY', items: { type: 'STRING' } } }, required: ['name', 'description', 'context'] } },
+  { name: 'list_bots',         description: 'List other agents and their status',                              parameters: { type: 'OBJECT', properties: {} } },
+  { name: 'delegate_task',     description: 'Assign a task to another agent. Always use wait=true (default) to receive the result unless you explicitly do not need it.', parameters: { type: 'OBJECT', properties: { botId: { type: 'STRING' }, title: { type: 'STRING' }, description: { type: 'STRING' }, wait: { type: 'BOOLEAN' }, timeoutSeconds: { type: 'NUMBER' } }, required: ['botId', 'title', 'description'] } },
+  { name: 'spawn_agent',       description: 'Create and start a new agent, ready to receive tasks',              parameters: { type: 'OBJECT', properties: { name: { type: 'STRING' }, model: { type: 'STRING' }, soulId: { type: 'STRING' } }, required: ['name'] } },
+  { name: 'kill_agent',        description: 'Permanently shut down and delete another agent',                    parameters: { type: 'OBJECT', properties: { botId: { type: 'STRING' } }, required: ['botId'] } },
 ];
 
-async function runGeminiAgent(bot: Bot, task: Task, tools: ReturnType<typeof createTools>) {
+async function runGeminiAgent(bot: Bot, task: Task, tools: ReturnType<typeof createTools>, signal: AbortSignal) {
   const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY || '');
   const model = genAI.getGenerativeModel({
     model: bot.model,
@@ -857,7 +1091,7 @@ async function runGeminiAgent(bot: Bot, task: Task, tools: ReturnType<typeof cre
   const skillsNote = allSkills.length > 0
     ? `\n\nAVAILABLE SKILLS:\n${allSkills.map((s: any) => `  • ${s.name}: ${s.description}`).join('\n')}\nCall load_skill("skill-name") to get full instructions and code files.`
     : '';
-  const systemNote = `Before writing new code, call list_library to check for existing programs. Save reusable programs to the library. Use search_memory to recall past task learnings when relevant.`;
+  const systemNote = `MANDATORY FIRST STEP: Call log_plan with a numbered list of steps before any other tool call. Then: before writing new code, call list_library to check for existing programs. Save reusable programs to the library. Use search_memory to recall past task learnings when relevant. Use list_bots + delegate_task to assign subtasks to other idle agents. Use spawn_agent to create new agents when needed, and kill_agent to clean up temporary agents when done.`;
   const prompt = `${systemNote}${memNote}${skillsNote}\n\nTask: ${task.title}\n\nDescription: ${task.description}`;
 
   let response = await withRetry(
@@ -872,6 +1106,8 @@ async function runGeminiAgent(bot: Bot, task: Task, tools: ReturnType<typeof cre
   );
 
   for (let i = 0; i < 20; i++) {
+    if (signal.aborted) throw new Error('Task cancelled');
+
     const candidate = response.response.candidates?.[0];
     if (!candidate) break;
 
@@ -917,7 +1153,12 @@ async function runGeminiAgent(bot: Bot, task: Task, tools: ReturnType<typeof cre
 // ─── Main entry ───────────────────────────────────────────────────────────────
 
 export async function runAgentTask(bot: Bot, task: Task) {
-  const tools = createTools(bot.id, task.id);
+  const controller = new AbortController();
+  runningTasks.set(task.id, controller);
+  taskRunNumbers.set(task.id, (task as any).runCount ?? 1);
+  const { signal } = controller;
+
+  const tools = createTools(bot.id, task.id, signal);
 
   try {
     await setBotStatus(bot.id, 'planning');
@@ -929,9 +1170,9 @@ export async function runAgentTask(bot: Bot, task: Task) {
 
     let result: string;
     if (bot.model.startsWith('gemini-')) {
-      result = await runGeminiAgent(bot, task, tools);
+      result = await runGeminiAgent(bot, task, tools, signal);
     } else {
-      result = await runClaudeAgent(bot, task, tools);
+      result = await runClaudeAgent(bot, task, tools, signal);
     }
 
     // Clean up temp execution files
@@ -959,9 +1200,12 @@ export async function runAgentTask(bot: Bot, task: Task) {
       wsManager.emitToBot(bot.id, { type: 'memory:saved', botId: bot.id, payload: savedMemory });
     }
   } catch (err) {
-    const msg = err instanceof Error ? err.message : String(err);
-    // Still clean up temp files on failure
     cleanupTempFiles(bot.id);
+
+    // If the task was cancelled, the cancel endpoint already updated DB and emitted WS — exit silently
+    if (signal.aborted) return;
+
+    const msg = err instanceof Error ? err.message : String(err);
     await setTaskStatus(task.id, 'failed', { result: msg });
     await setBotStatus(bot.id, 'failed');
     await addLog(bot.id, task.id, `❌ Task failed: ${msg}`, 'error');
@@ -979,5 +1223,8 @@ export async function runAgentTask(bot: Bot, task: Task) {
     if (savedMemory) {
       wsManager.emitToBot(bot.id, { type: 'memory:saved', botId: bot.id, payload: savedMemory });
     }
+  } finally {
+    runningTasks.delete(task.id);
+    taskRunNumbers.delete(task.id);
   }
 }

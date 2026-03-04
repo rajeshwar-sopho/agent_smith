@@ -2,7 +2,7 @@ import { Router } from 'express';
 import { z } from 'zod';
 import { prisma } from '../db/client';
 import { wsManager } from '../services/websocket';
-import { runAgentTask } from '../services/agent';
+import { runAgentTask, cancelTask } from '../services/agent';
 
 const router = Router();
 
@@ -82,18 +82,46 @@ router.post('/:id/retry', async (req, res) => {
     const bot = await prisma.bot.findUnique({ where: { id: task.botId } });
     if (!bot) return res.status(404).json({ error: 'Bot not found' });
 
-    // Reset task state and clear old logs for this task
+    // Reset task state, increment run counter (preserves old logs under previous runNumber)
     const updated = await prisma.task.update({
       where: { id: task.id },
-      data: { status: 'pending', result: null, tokenUsage: 0 },
+      data: { status: 'pending', result: null, tokenUsage: 0, runCount: { increment: 1 } } as any,
     });
-    await prisma.log.deleteMany({ where: { taskId: task.id } });
 
     res.json(updated);
 
     runAgentTask(bot, updated).catch((err) => {
       console.error('Agent retry error:', err);
     });
+  } catch (e) {
+    res.status(500).json({ error: String(e) });
+  }
+});
+
+// POST /api/tasks/:id/cancel
+router.post('/:id/cancel', async (req, res) => {
+  try {
+    const task = await prisma.task.findUnique({ where: { id: req.params.id } });
+    if (!task) return res.status(404).json({ error: 'Task not found' });
+
+    const cancellable = ['pending', 'planning', 'executing', 'waiting_for_human', 'waiting'];
+    if (!cancellable.includes(task.status)) {
+      return res.status(409).json({ error: `Task is already ${task.status}` });
+    }
+
+    // Abort the running agent loop (if active)
+    cancelTask(task.id);
+
+    // Update DB and notify frontend
+    const updated = await prisma.task.update({
+      where: { id: task.id },
+      data: { status: 'cancelled', result: 'Cancelled by user' },
+    });
+    await prisma.bot.update({ where: { id: task.botId }, data: { status: 'idle' } });
+    wsManager.broadcast({ type: 'task:cancelled', botId: task.botId, payload: { taskId: task.id } });
+    wsManager.statusChange(task.botId, 'idle');
+
+    res.json(updated);
   } catch (e) {
     res.status(500).json({ error: String(e) });
   }

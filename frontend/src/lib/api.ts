@@ -20,10 +20,11 @@ export interface Task {
   botId: string;
   title: string;
   description: string;
-  status: 'pending' | 'planning' | 'executing' | 'waiting' | 'done' | 'failed';
+  status: 'pending' | 'planning' | 'executing' | 'waiting' | 'done' | 'failed' | 'cancelled';
   plan: string | null;
   result: string | null;
   tokenUsage: number;
+  runCount: number;
   createdAt: string;
   updatedAt: string;
   subtasks?: Subtask[];
@@ -42,9 +43,10 @@ export interface Log {
   id: string;
   botId: string;
   taskId: string | null;
-  level: 'info' | 'warn' | 'error' | 'tool';
+  level: 'info' | 'warn' | 'error' | 'tool' | 'plan';
   message: string;
   meta: string | null;
+  runNumber: number;
   createdAt: string;
 }
 
@@ -96,6 +98,7 @@ export const api = {
     req<Task>('/tasks', { method: 'POST', body: JSON.stringify(data) }),
   deleteTask: (id: string) => req<{ deleted: boolean }>(`/tasks/${id}`, { method: 'DELETE' }),
   retryTask: (id: string) => req<Task>(`/tasks/${id}/retry`, { method: 'POST' }),
+  cancelTask: (id: string) => req<Task>(`/tasks/${id}/cancel`, { method: 'POST' }),
 
   // Logs
   getLogs: (botId: string, taskId?: string) =>
